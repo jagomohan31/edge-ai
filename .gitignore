@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+*.parquet
+*.lock
+data/raw/
+data/clean/
+data/derived/
+runs/
+.pytest_cache/
+.ruff_cache/
+docs/REPORT.md

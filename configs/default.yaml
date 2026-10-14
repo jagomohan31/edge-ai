@@ -1,0 +1,81 @@
+ata:
+  raw_dir: data/raw
+  clean_dir: data/clean
+  derived_dir: data/derived
+  throttle_seconds: 1.0
+  symbols: [GOLDM, GOLDTEN, GOLDGUINEA, GOLDPETAL]
+  reference_symbols: []
+
+volume_units: lots   # confirm after first real fetch: lots | units
+
+contracts:
+  GOLDM:
+    lot_g: 100
+    quote_g: 10
+    fineness: 0.995
+    tick_inr: 1
+    expiry_window: [3, 5]
+  GOLDTEN:
+    lot_g: 10
+    quote_g: 10
+    fineness: 0.999
+    tick_inr: 1
+    expiry_window: [27, 31]
+  GOLDGUINEA:
+    lot_g: 8
+    quote_g: 8
+    fineness: 0.999
+    tick_inr: 1
+    expiry_window: [27, 31]
+  GOLDPETAL:
+    lot_g: 1
+    quote_g: 1
+    fineness: 0.999
+    tick_inr: 1
+    expiry_window: [27, 31]
+
+curve:
+  max_extrapolation_days: 7
+  gold_factor_horizon_days: 30
+
+signals:
+  baseline_window: 60
+  dte_buckets: [0, 5, 10, 20, 40, 400]
+  z_threshold: 2.0
+  min_net_edge_bps: 2.0
+  cooldown_sessions: 5
+  max_maturity_gap_days: 7
+  holding_horizon_sessions: 5
+  stop_z: 4.0
+
+liquidity:
+  min_traded_g_quantile: 0.25
+  min_oi_g_quantile: 0.25
+  max_participation: 0.10
+
+lifecycle:
+  delivery_cutoff_sessions: 5
+
+costs:
+  ctt_sell: 0.0001
+  exchange_txn: 0.000021
+  stamp_buy: 0.00002
+  sebi_per_crore_inr: 10
+  gst: 0.18
+  brokerage_per_order_inr: 20
+  slippage_ticks_per_side: 1
+  slippage_stress: [1, 2, 3]
+
+backtest:
+  fill_rule: next_open
+  split:
+    develop: 0.6
+    validate: 0.2
+    locked: 0.2
+  basket_g: 200
+  basket_multiples: 1
+
+stats:
+  bootstrap_resamples: 10000
+  placebo_draws: 1000
+  seed: 42

@@ -1,0 +1,3 @@
+﻿# Paste ONE cURL command here (DevTools > Network > right-click the data request > Copy > Copy as cURL).
+# The fetcher parses the URL, headers and body from this file and substitutes the date (DD/MM/YYYY).
+# Do not commit cookies or tokens if the repo is public.
