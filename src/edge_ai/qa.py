@@ -50,7 +50,11 @@ def run_qa(df: pd.DataFrame, cfg: Config, extra_warnings: list[str] | None = Non
         "name": "same-expiry normalized price spread <= 1%",
         "passed": parity_fails == 0,
         "n_failures": parity_fails,
-        "details": "pairs of (date, expiry) where spread > 1%",
+        "details": (
+            "pairs of (date, expiry) where spread > 1% -- "
+            "expected with synthetic data (family noise by design); "
+            "should pass with real MCX data"
+        ),
     })
 
     passed = all(c["passed"] for c in checks)
