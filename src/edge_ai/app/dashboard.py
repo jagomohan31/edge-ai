@@ -1,432 +1,438 @@
 """dashboard.py: Streamlit multi-page dashboard for Edge AI (Req 7)."""
 from __future__ import annotations
 
+import glob
+import json
 from pathlib import Path
 
 import streamlit as st
 
+_CSS = """
+<style>
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg,#0f0f1a 0%,#1a1a2e 60%,#16213e 100%);
+}
+[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
+.main .block-container { padding-top:1.2rem; max-width:1200px; }
+[data-testid="stMetric"] {
+    background:#1e1e2e; border:1px solid #2a2a3e;
+    border-radius:10px; padding:10px 16px !important;
+}
+[data-testid="stMetricValue"] { color:#fff !important; font-size:20px !important; }
+.synth { background:#2d1515; border:1px solid #c44; border-radius:8px;
+    padding:10px 16px; margin-bottom:12px; color:#f88; font-size:13px; }
+</style>
+"""
 
-# Detect synthetic data
 def _is_synthetic() -> bool:
-    panel_path = Path("data/clean/panel.parquet")
-    if panel_path.exists():
+    p = Path("data/clean/panel.parquet")
+    if p.exists():
         try:
             import pandas as pd
-            df = pd.read_parquet(panel_path, columns=["synthetic"])
-            return bool(df["synthetic"].any())
+            return bool(pd.read_parquet(p, columns=["synthetic"])["synthetic"].any())
         except Exception:
             pass
-    return True  # no data yet == demo mode
-
-
-def main() -> None:
-    st.set_page_config(
-        page_title="Edge AI — MCX Gold Analytics",
-        page_icon="🥇",
-        layout="wide",
-    )
-
-    if _is_synthetic():
-        st.error(
-            "SYNTHETIC DATA — All numbers on this dashboard are from the synthetic "
-            "generator and do not represent real MCX prices. Fetch real data to remove this banner.",
-            icon="🔴",
-        )
-
-    st.title("Edge AI — MCX Gold Futures Analytics")
-    st.caption("Hack in Hills '26  |  Problem Statement 03  |  Commodity Derivatives Intelligence")
-
-    pages = {
-        "Parity Monitor": _page_parity,
-        "Curve & Carry": _page_curve,
-        "Lifecycle Calendar": _page_lifecycle,
-        "Alerts": _page_alerts,
-        "Backtest Lab": _page_backtest,
-        "Data Health": _page_health,
-    }
-
-    page = st.sidebar.radio("Page", list(pages.keys()))
-    pages[page]()
+    return True
 
 
 def _load(path: str):
     import pandas as pd
     p = Path(path)
-    if not p.exists():
-        return None
-    return pd.read_parquet(p)
-
-def _net_col(trades):
-    """Return the net P&L column name regardless of which schema the run used."""
-    if 'net_inr' in trades.columns:
-        return 'net_inr'
-    if 'net_pnl_inr' in trades.columns:
-        return 'net_pnl_inr'
-    return None
+    return pd.read_parquet(p) if p.exists() else None
 
 
-def _gross_col(trades):
-    """Return the gross P&L column name."""
-    if 'gross_inr' in trades.columns:
-        return 'gross_inr'
-    if 'gross_pnl_inr' in trades.columns:
-        return 'gross_pnl_inr'
-    return None
+def _nc(t):
+    return next((c for c in ("net_inr", "net_pnl_inr") if c in t.columns), None)
 
 
-def _cost_col(trades):
-    """Return the cost column name."""
-    if 'cost_inr' in trades.columns:
-        return 'cost_inr'
-    if 'entry_cost_inr' in trades.columns:
-        # old schema: entry_cost + exit_cost
-        return None  # handled specially
-    return None
+def _gc(t):
+    return next((c for c in ("gross_inr", "gross_pnl_inr") if c in t.columns), None)
 
 
+def _cc_sum(t) -> float:
+    if "cost_inr" in t.columns:
+        return float(t["cost_inr"].sum())
+    if "entry_cost_inr" in t.columns:
+        return float((t["entry_cost_inr"] + t["exit_cost_inr"]).sum())
+    return 0.0
+
+
+def _inr(v) -> str:
+    try:
+        return "n/a" if v != v else f"\u20b9{v:,.0f}"
+    except Exception:
+        return "n/a"
+
+
+PAGES = [
+    ("\U0001f4ca", "Parity Monitor"),
+    ("\U0001f4c8", "Curve & Carry"),
+    ("\U0001f4c5", "Lifecycle"),
+    ("\U0001f6a8", "Alerts"),
+    ("\U0001f9ea", "Backtest Lab"),
+    ("\U0001f3e5", "Data Health"),
+]
+
+
+def _sidebar() -> str:
+    with st.sidebar:
+        st.markdown(
+            "<div style='padding:16px 0 8px;font-size:22px;font-weight:700;"
+            "color:#636efa;'>\U0001f947 Edge AI</div>"
+            "<div style='font-size:11px;color:#505070;padding-bottom:10px;"
+            "border-bottom:1px solid #252535;margin-bottom:10px;'>"
+            "MCX Gold Futures Analytics</div>",
+            unsafe_allow_html=True,
+        )
+        if "page" not in st.session_state:
+            st.session_state["page"] = PAGES[0][1]
+        for icon, label in PAGES:
+            active = st.session_state["page"] == label
+            bg = "rgba(99,110,250,0.18)" if active else "transparent"
+            bl = "3px solid #636efa" if active else "3px solid transparent"
+            st.markdown(
+                f"<div style='background:{bg};border-left:{bl};"
+                "border-radius:8px;margin:2px 0;'>",
+                unsafe_allow_html=True,
+            )
+            if st.button(f"{icon}  {label}", key=f"nav_{label}",
+                         use_container_width=True):
+                st.session_state["page"] = label
+            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<hr style='border-color:#252535;margin:20px 0 8px;'>"
+            "<div style='font-size:10px;color:#404055;text-align:center;'>"
+            "Hack in Hills '26 \u00b7 PS-03 \u00b7 v1.1.0</div>",
+            unsafe_allow_html=True,
+        )
+    return st.session_state["page"]
+
+
+def _hdr(title: str, sub: str = "") -> None:
+    st.markdown(
+        f"<div style='border-bottom:1px solid #2a2a3a;padding-bottom:12px;"
+        f"margin-bottom:16px;'><span style='font-size:24px;font-weight:700;'>"
+        f"{title}</span>"
+        + (f"<br><span style='font-size:13px;color:#808090;'>{sub}</span>" if sub else "")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
 def _page_parity() -> None:
-    st.header("Parity Monitor")
-    st.caption("Normalized price gaps between gold contract families (basis points)")
+    _hdr("\U0001f4ca Parity Monitor",
+         "Normalized price gaps between gold contract families (basis points)")
     gaps = _load("data/derived/gaps.parquet")
     if gaps is None or gaps.empty:
         st.info("No gaps data. Run `edge-ai analyze` first.")
         return
-
     import plotly.express as px
-
     latest_date = gaps["date"].max()
     latest = gaps[gaps["date"] == latest_date].copy()
-
-    st.metric("Latest date", str(latest_date))
-
-    col1, col2 = st.columns(2)
-    with col1:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Latest date", str(latest_date)[:10])
+    c2.metric("Pair count", len(latest))
+    c3.metric("Max gap (bps)", f"{latest['gap_bps'].abs().max():.1f}")
+    liq = int((latest["liq_ok_a"] & latest["liq_ok_b"]).sum()) if "liq_ok_a" in latest.columns else 0
+    c4.metric("Liquid pairs", liq)
+    col_a, col_b = st.columns([3, 2])
+    with col_a:
         st.subheader("Latest gaps")
-        st.dataframe(
-            latest[[col for col in ["fam_a", "fam_b", "dte_b", "gap_bps", "leg_gap_days", "extrap_days", "liq_ok_a", "liq_ok_b", "stale"] if col in latest.columns]],
-            use_container_width=True,
-        )
-    with col2:
-        st.subheader("Purity / carry / noise decomposition")
-        st.caption("Gap components are not yet decomposed in this build. Shown: raw gap with cost band.")
-        if not latest.empty:
-            fig_bar = px.bar(
-                latest.sort_values("gap_bps"),
-                x="gap_bps", y="fam_a",
-                orientation="h",
-                color="gap_bps",
-                color_continuous_scale="RdYlGn_r",
-                title="Current gap (bps) by family pair",
-                labels={"fam_a": "Family A", "gap_bps": "Gap (bps)"},
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-
+        disp = [c for c in ["fam_a","fam_b","dte_b","gap_bps","leg_gap_days","liq_ok_a","liq_ok_b","stale"] if c in latest.columns]
+        st.dataframe(latest[disp], use_container_width=True, hide_index=True)
+    with col_b:
+        fig = px.bar(latest.sort_values("gap_bps"), x="gap_bps", y="fam_a",
+                     orientation="h", color="gap_bps",
+                     color_continuous_scale="RdYlGn_r", template="plotly_dark",
+                     title="Gap by family (bps)", labels={"fam_a":"","gap_bps":"bps"})
+        fig.update_layout(margin=dict(l=0,r=0,t=36,b=0), height=260,
+                          coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
     st.subheader("Gap history")
-    fig = px.line(
-        gaps.sort_values("date"),
-        x="date", y="gap_bps",
-        color="fam_a",
-        facet_col="fam_b",
-        title="Parity gap history (bps) — past-only baseline",
-        labels={"gap_bps": "Gap (bps)", "date": "Date"},
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    fig2 = px.line(gaps.sort_values("date"), x="date", y="gap_bps",
+                   color="fam_a", facet_col="fam_b", template="plotly_dark",
+                   title="Parity gap history (bps)", labels={"gap_bps":"bps","date":""})
+    fig2.update_layout(margin=dict(t=40,b=0), height=320)
+    st.plotly_chart(fig2, use_container_width=True)
 
 
 def _page_curve() -> None:
-    st.header("Curve & Carry")
+    _hdr("\U0001f4c8 Curve & Carry",
+         "Term structure, implied carry, constant-maturity gold factor G")
     curves = _load("data/derived/curves.parquet")
     factor = _load("data/derived/factor.parquet")
     if curves is None:
         st.info("No curve data. Run `edge-ai analyze` first.")
         return
-
     import plotly.express as px
-
     latest_date = curves["date"].max()
-    latest_curves = curves[curves["date"] == latest_date]
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader(f"Term structure — {latest_date}")
-        fig = px.line(
-            latest_curves[latest_curves["traded"]],
-            x="dte", y="ln_px_fine",
-            color="family",
-            markers=True,
-            title="ln(price per fine gram) vs days-to-expiry",
-            labels={"dte": "Days to expiry", "ln_px_fine": "ln(px per fine gram)"},
-        )
+    lc = curves[curves["date"] == latest_date]
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fig = px.line(lc[lc["traded"]], x="dte", y="ln_px_fine", color="family",
+                      markers=True, template="plotly_dark",
+                      title=f"Term structure {str(latest_date)[:10]}",
+                      labels={"dte":"Days to expiry","ln_px_fine":"ln(price/fine g)"})
+        fig.update_layout(margin=dict(t=40,b=0), height=320)
         st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
+    with col_b:
         if factor is not None and not factor.empty:
-            st.subheader("Constant-maturity gold factor G")
-            st.line_chart(factor.set_index("date")["G"])
-
+            fig_g = px.line(factor, x="date", y="G", template="plotly_dark",
+                            title="Gold factor G (INR/fine gram)",
+                            labels={"G":"G (INR)","date":""})
+            fig_g.update_layout(margin=dict(t=40,b=0), height=320)
+            st.plotly_chart(fig_g, use_container_width=True)
     if "implied_carry_ann" in curves.columns:
         carry = curves[curves["implied_carry_ann"].notna()]
         if not carry.empty:
-            st.subheader("Implied annualised carry by family")
-            fig2 = px.line(
-                carry, x="date", y="implied_carry_ann",
-                color="family",
-                title="Implied carry (annualised) history",
-                labels={"implied_carry_ann": "Carry (ann.)", "date": "Date"},
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
+            fig_c = px.line(carry, x="date", y="implied_carry_ann", color="family",
+                            template="plotly_dark", title="Implied annualised carry",
+                            labels={"implied_carry_ann":"Carry (ann.)","date":""})
+            fig_c.update_layout(margin=dict(t=40,b=0), height=300)
+            st.plotly_chart(fig_c, use_container_width=True)
 
 def _page_lifecycle() -> None:
-    st.header("Lifecycle Calendar")
+    _hdr("\U0001f4c5 Lifecycle Calendar",
+         "Contract listing, liquidity build-up, delivery cutoff")
     lc = _load("data/derived/lifecycle.parquet")
     if lc is None:
         st.info("No lifecycle data. Run `edge-ai build` first.")
         return
-
-    st.subheader("Contract calendar")
-    st.dataframe(lc, use_container_width=True)
-
     import pandas as pd
     import plotly.express as px
-
+    st.subheader("Contract summary")
+    st.dataframe(lc, use_container_width=True, hide_index=True)
     lc2 = lc.copy()
-    for col in ["first_seen", "first_traded", "last_traded", "delivery_cutoff_date"]:
+    for col in ["first_traded", "last_traded"]:
         if col in lc2.columns:
             lc2[col] = pd.to_datetime(lc2[col], errors="coerce")
-
     if "first_traded" in lc2.columns and "last_traded" in lc2.columns:
-        gantt_rows = []
-        for _, row in lc2.iterrows():
-            if pd.notna(row.get("first_traded")) and pd.notna(row.get("last_traded")):
-                gantt_rows.append({
-                    "Contract": f"{row['symbol']} {row['expiry']}",
-                    "Start": row["first_traded"],
-                    "Finish": row["last_traded"],
-                    "Symbol": row["symbol"],
-                })
-        if gantt_rows:
-            gantt_df = pd.DataFrame(gantt_rows)
-            fig = px.timeline(
-                gantt_df, x_start="Start", x_end="Finish",
-                y="Contract", color="Symbol",
-                title="Contract trading windows",
-            )
+        rows = [{"Contract": f"{r['symbol']} {str(r['expiry'])[:7]}",
+                 "Start": r["first_traded"], "Finish": r["last_traded"],
+                 "Symbol": r["symbol"]}
+                for _, r in lc2.iterrows()
+                if pd.notna(r.get("first_traded")) and pd.notna(r.get("last_traded"))]
+        if rows:
+            gdf = pd.DataFrame(rows)
+            fig = px.timeline(gdf, x_start="Start", x_end="Finish",
+                              y="Contract", color="Symbol", template="plotly_dark",
+                              title="Contract active trading windows")
             fig.update_yaxes(autorange="reversed")
+            fig.update_layout(margin=dict(t=40,b=0), height=500)
             st.plotly_chart(fig, use_container_width=True)
 
 
 def _page_alerts() -> None:
-    st.header("Alerts")
-    st.caption("Quiet by default — every day produces a record. Silence means no gate passed.")
-
-    gaps = _load("data/derived/gaps.parquet")
+    _hdr("\U0001f6a8 Alerts",
+         "Quiet by default. Every day produces a record. Silence means no gate passed.")
     panel = _load("data/clean/panel.parquet")
-    if gaps is None or panel is None:
-        st.info("Run `edge-ai analyze` first.")
+    if panel is None:
+        st.info("Run `edge-ai build` first.")
         return
-
-    import pandas as pd
     import plotly.express as px
 
     from edge_ai.config import load_config
     from edge_ai.signals import compute_signals
-
     cfg = load_config()
-    recs = compute_signals(gaps, panel, cfg)
-
-    df = pd.DataFrame([{
-        "date": r.date,
-        "pair": f"{r.fam_a}/{r.fam_b}",
-        "expiry_b": r.expiry_b,
-        "dte_b": r.dte_b,
-        "gap_bps": round(r.gap_bps, 2),
-        "z": round(r.z, 2) if r.z == r.z else None,
-        "alert": r.alert,
-        "gate_blocked": r.nearest_miss_gate,
-        "net_edge_bps": round(r.net_edge_bps, 2) if r.net_edge_bps == r.net_edge_bps else None,
-    } for r in recs])
-
-    alerts = df[df["alert"]]
-    no_signal = df[~df["alert"]]
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total signal records", len(df))
-    col2.metric("Alerts fired", len(alerts))
-    col3.metric("No-signal records", len(no_signal))
-
+    sigs = compute_signals(panel, cfg)
+    if not hasattr(sigs, "columns") or "alert" not in sigs.columns:
+        st.warning("Signals format unexpected.")
+        return
+    alerts = sigs[sigs["alert"]]
+    no_sig = sigs[~sigs["alert"]]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total records", len(sigs))
+    c2.metric("\U0001f6a8 Alerts fired", len(alerts))
+    c3.metric("\U0001f910 No-signal records", len(no_sig))
     if not alerts.empty:
-        st.subheader(f"Alerts ({len(alerts)})")
-        st.dataframe(alerts, use_container_width=True)
-
-        fig = px.scatter(
-            alerts, x="date", y="gap_bps",
-            color="pair", size="z",
-            title="Alerts: gap (bps) and z-score over time",
-            labels={"gap_bps": "Gap (bps)", "date": "Date"},
-        )
+        st.subheader(f"Active alerts ({len(alerts)})")
+        st.dataframe(alerts, use_container_width=True, hide_index=True)
+        fig = px.scatter(alerts, x="date", y="gap_bps",
+                         color="pair" if "pair" in alerts.columns else "fam_a",
+                         size="z" if "z" in alerts.columns else None,
+                         template="plotly_dark", title="Alert timeline")
+        fig.update_layout(margin=dict(t=40,b=0), height=300)
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.success("No alerts fired on this dataset. Silence is a valid, honest result.")
-
-    with st.expander(f"No-signal records — nearest miss ({len(no_signal)})"):
-        st.dataframe(
-            no_signal[["date", "pair", "gate_blocked", "gap_bps", "z"]].tail(100),
-            use_container_width=True,
+        st.success(
+            "\U0001f910 **No alerts fired.** No gap survived all gates after costs. "
+            "This is a valid, honest result — the system is working correctly."
         )
-
+    if "blocked_by" in no_sig.columns:
+        st.subheader("Gate blocking breakdown")
+        blk = no_sig["blocked_by"].value_counts().reset_index()
+        blk.columns = ["Gate", "Count"]
+        fig_b = px.bar(blk, x="Count", y="Gate", orientation="h",
+                       color="Count", color_continuous_scale="Blues",
+                       template="plotly_dark", title="Why signals were blocked")
+        fig_b.update_layout(margin=dict(t=40,b=0), height=260,
+                             coloraxis_showscale=False)
+        st.plotly_chart(fig_b, use_container_width=True)
+    with st.expander(f"\U0001f4cb No-signal log ({len(no_sig)} records, last 200)"):
+        show = [c for c in ["date","pair","fam_a","fam_b","blocked_by","gap_bps","z","net_edge_bps"] if c in no_sig.columns]
+        st.dataframe(no_sig[show].tail(200), use_container_width=True, hide_index=True)
 
 def _page_backtest() -> None:
-    st.header("Backtest Lab")
-
-    import glob
-    import json
-
+    _hdr("\U0001f9ea Backtest Lab",
+         "Equity curve, P&L waterfall, bootstrap CI, slippage stress, trade blotter")
     run_dirs = sorted(glob.glob("runs/*/summary.json"), reverse=True)
     if not run_dirs:
         st.info("No runs yet. Run `edge-ai backtest` first.")
         return
-
-    run_options = []
-    for path in run_dirs:
-        with open(path) as f:
-            s = json.load(f)
-        run_options.append((s["run_id"], s.get("window", "?"), s.get("n_trades", 0)))
-
-    labels = [f"{r} ({w}, {n} trades)" for r, w, n in run_options]
-    selected_idx = st.selectbox("Run", range(len(labels)), format_func=lambda i: labels[i])
-    run_id, window, _ = run_options[selected_idx]
-    run_dir = Path("runs") / run_id
-
     import plotly.express as px
     import plotly.graph_objects as go
-
+    run_opts = []
+    for rp in run_dirs:
+        with open(rp) as f:
+            s = json.load(f)
+        run_opts.append((s["run_id"], s.get("window", "?"), s.get("n_trades", 0)))
+    labels = [f"{r}  --  {w} window  ({n} trades)" for r, w, n in run_opts]
+    idx = st.selectbox("Select run", range(len(labels)), format_func=lambda i: labels[i])
+    run_id, window, _ = run_opts[idx]
+    run_dir = Path("runs") / run_id
     equity = _load(str(run_dir / "equity.parquet"))
     trades = _load(str(run_dir / "trades.parquet"))
-
-    if equity is not None and not equity.empty:
-        st.subheader("Net equity curve")
-        fig_eq = px.line(
-            equity, x="date", y="portfolio_value",
-            title=f"Net portfolio value — {window} window",
-            labels={"portfolio_value": "Portfolio value (INR)", "date": "Date"},
-        )
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-    if trades is not None and not trades.empty:
-        gc = _gross_col(trades)
-        gross = float(trades[gc].sum()) if gc else (float((trades['gross_pnl_inr']).sum()) if 'gross_pnl_inr' in trades.columns else 0.0)
-        cc = _cost_col(trades)
-        if cc:
-            costs = float(trades[cc].sum())
-        elif 'entry_cost_inr' in trades.columns and 'exit_cost_inr' in trades.columns:
-            costs = float((trades['entry_cost_inr'] + trades['exit_cost_inr']).sum())
-        else:
-            costs = 0.0
-        nc = _net_col(trades)
-        net = float(trades[nc].sum()) if nc else gross - costs
-
-        # Attribution waterfall
-        st.subheader("P&L attribution waterfall")
-        waterfall_fig = go.Figure(go.Waterfall(
-            name="P&L",
-            orientation="v",
-            measure=["relative", "relative", "total"],
+    if trades is None or trades.empty:
+        st.info("0 trades in this run -- no alert passed all gates after costs. "
+                "Select an older run from the dropdown to see historical results.")
+        return
+    gc = _gc(trades)
+    nc = _nc(trades)
+    gross = float(trades[gc].sum()) if gc else 0.0
+    costs = _cc_sum(trades)
+    net = float(trades[nc].sum()) if nc else gross - costs
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Gross P&L", _inr(gross))
+    c2.metric("Total costs", _inr(costs))
+    delta_label = "positive" if net > 0 else "negative"
+    delta_color = "normal" if net > 0 else "inverse"
+    c3.metric("Net P&L", _inr(net), delta=delta_label, delta_color=delta_color)
+    c4.metric("Trades", len(trades))
+    t1, t2, t3, t4 = st.tabs(["Equity Curve", "Attribution Waterfall",
+                               "Statistics", "Trade Blotter"])
+    with t1:
+        if equity is not None and not equity.empty:
+            fig_eq = px.line(equity, x="date", y="portfolio_value",
+                             template="plotly_dark",
+                             title=f"Net equity curve -- {window} window",
+                             labels={"portfolio_value": "Portfolio value (INR)", "date": ""})
+            fig_eq.add_hline(y=1_000_000, line_dash="dot", line_color="#555",
+                             annotation_text="Starting capital")
+            fig_eq.update_layout(margin=dict(t=40, b=0), height=380)
+            st.plotly_chart(fig_eq, use_container_width=True)
+    with t2:
+        wf = go.Figure(go.Waterfall(
+            orientation="v", measure=["relative", "relative", "total"],
             x=["Gross spread P&L", "Costs", "Net P&L"],
             y=[gross, -costs, 0],
-            connector={"line": {"color": "rgb(63, 63, 63)"}},
+            connector={"line": {"color": "#444"}},
             decreasing={"marker": {"color": "#EF553B"}},
             increasing={"marker": {"color": "#00CC96"}},
             totals={"marker": {"color": "#636EFA"}},
+            text=[_inr(gross), _inr(costs), _inr(net)],
+            textposition="outside",
         ))
-        waterfall_fig.update_layout(title="Gross → Costs → Net P&L (INR)")
-        st.plotly_chart(waterfall_fig, use_container_width=True)
-
-        # Summary metrics
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Gross P&L (INR)", f"₹{gross:,.0f}")
-        col2.metric("Total costs (INR)", f"₹{costs:,.0f}", delta=f"-₹{costs:,.0f}", delta_color="inverse")
-        col3.metric("Net P&L (INR)", f"₹{net:,.0f}")
-        col4.metric("Trades", len(trades))
-
-        # Bootstrap CI
+        wf.update_layout(title="P&L waterfall: Gross to Costs to Net",
+                         template="plotly_dark", height=380, margin=dict(t=50, b=0))
+        st.plotly_chart(wf, use_container_width=True)
+    with t3:
         from edge_ai.config import load_config
         from edge_ai.stats import bootstrap_mean_pnl, slippage_stress, sub_period_results
         cfg = load_config()
-        bs = bootstrap_mean_pnl(trades, cfg)
-        st.subheader("Bootstrap confidence interval (mean net P&L per trade)")
-        bc1, bc2, bc3 = st.columns(3)
-        bc1.metric("Mean (INR)", f"₹{bs['mean']:,.0f}" if bs["mean"] == bs["mean"] else "n/a")
-        bc2.metric("95% CI low", f"₹{bs['ci_low']:,.0f}" if bs["ci_low"] == bs["ci_low"] else "n/a")
-        bc3.metric("95% CI high", f"₹{bs['ci_high']:,.0f}" if bs["ci_high"] == bs["ci_high"] else "n/a")
-
-        # Slippage stress
-        st.subheader("Slippage sensitivity")
-        sl_df = slippage_stress(trades, cfg.costs.slippage_stress)
-        if not sl_df.empty:
-            fig_sl = px.bar(
-                sl_df, x="slippage_multiplier", y="net_pnl",
-                title="Net P&L vs slippage cost multiplier",
-                labels={"slippage_multiplier": "Slippage multiplier", "net_pnl": "Net P&L (INR)"},
-                color="net_pnl",
-                color_continuous_scale=["red", "green"],
-            )
-            st.plotly_chart(fig_sl, use_container_width=True)
-
-        # Sub-period breakdown
-        st.subheader("Sub-period (quarterly) breakdown")
+        if nc:
+            t_std = trades.rename(columns={nc: "net_inr"}) if nc != "net_inr" else trades.copy()
+            if gc and gc != "gross_inr":
+                t_std = t_std.rename(columns={gc: "gross_inr"})
+            if "cost_inr" not in t_std.columns and "entry_cost_inr" in t_std.columns:
+                t_std["cost_inr"] = t_std["entry_cost_inr"] + t_std["exit_cost_inr"]
+            bs = bootstrap_mean_pnl(t_std, cfg)
+            st.subheader("Bootstrap CI (mean net P&L per trade)")
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Mean", _inr(bs["mean"]))
+            b2.metric("95% CI low", _inr(bs["ci_low"]))
+            b3.metric("95% CI high", _inr(bs["ci_high"]))
+            sl = slippage_stress(t_std, cfg.costs.slippage_stress)
+            if not sl.empty:
+                st.subheader("Slippage stress test")
+                fig_sl = px.bar(sl, x="slippage_multiplier", y="net_pnl",
+                                color="net_pnl", color_continuous_scale=["#EF553B", "#00CC96"],
+                                template="plotly_dark", title="Net P&L vs slippage multiplier",
+                                labels={"slippage_multiplier": "Multiplier", "net_pnl": "Net P&L"})
+                fig_sl.update_layout(margin=dict(t=40, b=0), height=280,
+                                     coloraxis_showscale=False)
+                st.plotly_chart(fig_sl, use_container_width=True)
         sp = sub_period_results(trades)
         if not sp.empty:
+            st.subheader("Sub-period (quarterly) breakdown")
             sp.columns = ["Quarter", "Net P&L", "Mean P&L", "Trades"]
-            st.dataframe(sp, use_container_width=True)
-
-        # Trade blotter
-        with st.expander(f"Trade blotter ({len(trades)} trades)"):
-            st.dataframe(trades, use_container_width=True)
-
+            st.dataframe(sp, use_container_width=True, hide_index=True)
+    with t4:
+        st.subheader(f"Trade blotter -- {len(trades)} trades")
+        st.dataframe(trades, use_container_width=True, hide_index=True)
 
 def _page_health() -> None:
-    st.header("Data Health")
+    _hdr("\U0001f3e5 Data Health", "QA report, volume and open interest over time")
     panel = _load("data/clean/panel.parquet")
     if panel is None:
         st.info("No panel. Run `edge-ai build` first.")
         return
-
     import plotly.express as px
 
     from edge_ai.config import load_config
     from edge_ai.qa import format_qa_report, run_qa
-
     cfg = load_config()
     qa = run_qa(panel, cfg)
-    st.text(format_qa_report(qa))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total rows", f"{len(panel):,}")
+    c2.metric("Sessions", panel["date"].nunique())
+    c3.metric("Stale rows", int(panel["stale"].sum()))
+    c4.metric("Zero-vol rows", int(panel["zero_vol"].sum()))
+    with st.expander("Full QA report"):
+        st.code(format_qa_report(qa))
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if "vol_g" in panel.columns:
+            vol = panel[panel["vol_g"] > 0].groupby(["date", "symbol"])["vol_g"].sum().reset_index()
+            fig = px.line(vol, x="date", y="vol_g", color="symbol",
+                          template="plotly_dark", title="Daily volume (grams)",
+                          labels={"vol_g": "Volume (g)", "date": ""})
+            fig.update_layout(margin=dict(t=40, b=0), height=300)
+            st.plotly_chart(fig, use_container_width=True)
+    with col_b:
+        if "oi_g" in panel.columns:
+            oi = panel.groupby(["date", "symbol"])["oi_g"].sum().reset_index()
+            fig2 = px.line(oi, x="date", y="oi_g", color="symbol",
+                           template="plotly_dark", title="Daily open interest (grams)",
+                           labels={"oi_g": "OI (g)", "date": ""})
+            fig2.update_layout(margin=dict(t=40, b=0), height=300)
+            st.plotly_chart(fig2, use_container_width=True)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total rows", len(panel))
-    col2.metric("Stale rows", int(panel["stale"].sum()))
-    col3.metric("Zero-vol rows", int(panel["zero_vol"].sum()))
-    col4.metric("Synthetic rows", int(panel["synthetic"].sum()) if "synthetic" in panel.columns else 0)
 
-    st.subheader("Volume (grams) by symbol over time")
-    if "vol_g" in panel.columns and "date" in panel.columns:
-        fig = px.line(
-            panel[panel["vol_g"] > 0].groupby(["date", "symbol"])["vol_g"].sum().reset_index(),
-            x="date", y="vol_g", color="symbol",
-            title="Daily traded volume (grams) per symbol",
-            labels={"vol_g": "Volume (grams)", "date": "Date"},
+def main() -> None:
+    st.set_page_config(
+        page_title="Edge AI -- MCX Gold Analytics",
+        page_icon="\U0001f947",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.markdown(_CSS, unsafe_allow_html=True)
+    if _is_synthetic():
+        st.markdown(
+            "<div class='synth'>"
+            "\U0001f534 <strong>SYNTHETIC DATA</strong> -- "
+            "All numbers are from the synthetic generator and do not represent real MCX prices. "
+            "Run <code>edge-ai fetch</code> and <code>edge-ai build</code> to load real data."
+            "</div>",
+            unsafe_allow_html=True,
         )
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Open interest (grams) by symbol over time")
-    if "oi_g" in panel.columns and "date" in panel.columns:
-        fig2 = px.line(
-            panel.groupby(["date", "symbol"])["oi_g"].sum().reset_index(),
-            x="date", y="oi_g", color="symbol",
-            title="Daily open interest (grams) per symbol",
-            labels={"oi_g": "Open interest (grams)", "date": "Date"},
-        )
-        st.plotly_chart(fig2, use_container_width=True)
+    page = _sidebar()
+    {
+        "Parity Monitor": _page_parity,
+        "Curve & Carry":  _page_curve,
+        "Lifecycle":      _page_lifecycle,
+        "Alerts":         _page_alerts,
+        "Backtest Lab":   _page_backtest,
+        "Data Health":    _page_health,
+    }.get(page, _page_parity)()
 
 
 if __name__ == "__main__":
