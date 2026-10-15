@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -5,12 +6,28 @@ __pycache__/
 dist/
 build/
 .env
+*.env.*
+
+# Data files (large binary -- not in repo)
 *.parquet
-*.lock
 data/raw/
 data/clean/
 data/derived/
+
+# Run artifacts
 runs/
+*.lock
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Dev tooling
 .pytest_cache/
 .ruff_cache/
+
+# Generated docs (rebuilt by CI)
 docs/REPORT.md
+
+# OS
+.DS_Store
+Thumbs.db

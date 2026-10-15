@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+statsmodels>=0.14
+pyarrow>=14
+pydantic>=2.5
+pyyaml>=6.0
+requests>=2.31
+typer>=0.9
+plotly>=5.18
+streamlit>=1.30

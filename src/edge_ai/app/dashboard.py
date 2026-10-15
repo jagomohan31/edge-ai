@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import glob
 import json
+import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -12,15 +15,28 @@ _CSS = """
 [data-testid="stSidebar"] {
     background: linear-gradient(180deg,#0f0f1a 0%,#1a1a2e 60%,#16213e 100%);
 }
-[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
+[data-testid="stSidebar"] button {
+    color: #c5cae9 !important;
+    background: transparent;
+    border: none;
+    text-align: left;
+    font-size: 14px;
+}
+[data-testid="stSidebar"] button:hover {
+    color: #ffffff !important;
+    background: rgba(99,110,250,0.12) !important;
+}
 .main .block-container { padding-top:1.2rem; max-width:1200px; }
-[data-testid="stMetric"] {
+[data-testid="metric-container"] {
     background:#1e1e2e; border:1px solid #2a2a3e;
     border-radius:10px; padding:10px 16px !important;
 }
-[data-testid="stMetricValue"] { color:#fff !important; font-size:20px !important; }
+[data-testid="stMetricValue"] { color:#ffffff !important; font-size:20px !important; }
+[data-testid="stMetricLabel"] { color:#9fa8da !important; }
 .synth { background:#2d1515; border:1px solid #c44; border-radius:8px;
-    padding:10px 16px; margin-bottom:12px; color:#f88; font-size:13px; }
+    padding:10px 16px; margin-bottom:12px; color:#f8b4b4; font-size:13px; }
+.live-badge { background:#1a3a1a; border:1px solid #2a8a2a; border-radius:8px;
+    padding:10px 16px; margin-bottom:12px; color:#a8f0a8; font-size:13px; }
 </style>
 """
 
@@ -33,6 +49,18 @@ def _is_synthetic() -> bool:
         except Exception:
             pass
     return True
+
+
+def _latest_date() -> str:
+    p = Path("data/clean/panel.parquet")
+    if p.exists():
+        try:
+            import pandas as pd
+            d = pd.read_parquet(p, columns=["date"])["date"].max()
+            return str(d)[:10]
+        except Exception:
+            pass
+    return "no data"
 
 
 def _load(path: str):
@@ -64,6 +92,19 @@ def _inr(v) -> str:
         return "n/a"
 
 
+def _run_cmd(args: list[str]) -> tuple[int, str, str]:
+    """Run edge-ai CLI command, return (returncode, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "edge_ai"] + args,
+            capture_output=True, text=True, timeout=120,
+            cwd=str(Path(__file__).parent.parent.parent.parent),
+        )
+        return result.returncode, result.stdout, result.stderr
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
 PAGES = [
     ("\U0001f4ca", "Parity Monitor"),
     ("\U0001f4c8", "Curve & Carry"),
@@ -72,7 +113,6 @@ PAGES = [
     ("\U0001f9ea", "Backtest Lab"),
     ("\U0001f3e5", "Data Health"),
 ]
-
 
 def _sidebar() -> str:
     with st.sidebar:
@@ -99,14 +139,83 @@ def _sidebar() -> str:
                          use_container_width=True):
                 st.session_state["page"] = label
             st.markdown("</div>", unsafe_allow_html=True)
+
+        # --- Live data panel ---
         st.markdown(
-            "<hr style='border-color:#252535;margin:20px 0 8px;'>"
+            "<hr style='border-color:#252535;margin:16px 0 12px;'>"
+            "<div style='font-size:11px;color:#636efa;font-weight:600;"
+            "margin-bottom:8px;'>\U0001f4e1 LIVE DATA</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div style='font-size:11px;color:#707090;margin-bottom:8px;'>"
+            f"Last data: <b style='color:#a0a0c0;'>{_latest_date()}</b></div>",
+            unsafe_allow_html=True,
+        )
+        curl_exists = Path("docs/bhavcopy_request.curl").exists()
+        curl_text = open("docs/bhavcopy_request.curl").read().strip() if curl_exists else ""
+        has_curl = curl_exists and len(curl_text) > 50 and "curl" in curl_text.lower()
+
+        if not has_curl:
+            st.markdown(
+                "<div style='font-size:11px;color:#f0a060;background:#2a1f10;"
+                "border:1px solid #6a4020;border-radius:6px;padding:8px;margin-bottom:8px;'>"
+                "\u26a0\ufe0f Paste MCX cURL into<br>"
+                "<code>docs/bhavcopy_request.curl</code><br>"
+                "to enable live fetch</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            if st.button("\U0001f504 Fetch Today & Rebuild", use_container_width=True,
+                         key="fetch_today"):
+                today = datetime.now().strftime("%Y-%m-%d")
+                with st.spinner("Fetching MCX data..."):
+                    rc, out, err = _run_cmd(["fetch", "--start", today, "--end", today])
+                if rc == 0:
+                    with st.spinner("Rebuilding pipeline..."):
+                        _run_cmd(["build"])
+                        _run_cmd(["analyze"])
+                        _run_cmd(["signals"])
+                    st.success("\u2705 Data updated!")
+                    st.rerun()
+                else:
+                    st.error(f"Fetch failed:\n{err[:300]}")
+
+            if st.button("\U0001f504 Full Rebuild (last 30 days)", use_container_width=True,
+                         key="fetch_month"):
+                import datetime as dt
+                end = dt.date.today()
+                start = end - dt.timedelta(days=30)
+                with st.spinner(f"Fetching {start} \u2192 {end}..."):
+                    rc, out, err = _run_cmd(["fetch", "--start", str(start), "--end", str(end)])
+                if rc == 0:
+                    with st.spinner("Building pipeline..."):
+                        _run_cmd(["build"])
+                        _run_cmd(["analyze"])
+                        _run_cmd(["signals"])
+                    st.success("\u2705 Pipeline updated!")
+                    st.rerun()
+                else:
+                    st.error(f"Error: {err[:300]}")
+
+        auto_refresh = st.checkbox(
+            "\U0001f501 Auto-refresh (30 s)",
+            value=False,
+            key="auto_refresh",
+            help="Reload dashboard data every 30 seconds",
+        )
+        if auto_refresh:
+            import time
+            time.sleep(30)
+            st.rerun()
+
+        st.markdown(
+            "<hr style='border-color:#252535;margin:16px 0 8px;'>"
             "<div style='font-size:10px;color:#404055;text-align:center;'>"
-            "Hack in Hills '26 \u00b7 PS-03 \u00b7 v1.1.0</div>",
+            "Hack in Hills '26 \u00b7 PS-03 \u00b7 v1.2.0</div>",
             unsafe_allow_html=True,
         )
     return st.session_state["page"]
-
 
 def _hdr(title: str, sub: str = "") -> None:
     st.markdown(
@@ -117,6 +226,7 @@ def _hdr(title: str, sub: str = "") -> None:
         + "</div>",
         unsafe_allow_html=True,
     )
+
 
 def _page_parity() -> None:
     _hdr("\U0001f4ca Parity Monitor",
@@ -132,26 +242,28 @@ def _page_parity() -> None:
     c1.metric("Latest date", str(latest_date)[:10])
     c2.metric("Pair count", len(latest))
     c3.metric("Max gap (bps)", f"{latest['gap_bps'].abs().max():.1f}")
-    liq = int((latest["liq_ok_a"] & latest["liq_ok_b"]).sum()) if "liq_ok_a" in latest.columns else 0
+    liq = int((latest["liq_ok_a"] & latest["liq_ok_b"]).sum()) \
+        if "liq_ok_a" in latest.columns else 0
     c4.metric("Liquid pairs", liq)
     col_a, col_b = st.columns([3, 2])
     with col_a:
         st.subheader("Latest gaps")
-        disp = [c for c in ["fam_a","fam_b","dte_b","gap_bps","leg_gap_days","liq_ok_a","liq_ok_b","stale"] if c in latest.columns]
+        disp = [c for c in ["fam_a", "fam_b", "dte_b", "gap_bps", "leg_gap_days",
+                             "liq_ok_a", "liq_ok_b", "stale"] if c in latest.columns]
         st.dataframe(latest[disp], use_container_width=True, hide_index=True)
     with col_b:
         fig = px.bar(latest.sort_values("gap_bps"), x="gap_bps", y="fam_a",
                      orientation="h", color="gap_bps",
                      color_continuous_scale="RdYlGn_r", template="plotly_dark",
-                     title="Gap by family (bps)", labels={"fam_a":"","gap_bps":"bps"})
-        fig.update_layout(margin=dict(l=0,r=0,t=36,b=0), height=260,
+                     title="Gap by family (bps)", labels={"fam_a": "", "gap_bps": "bps"})
+        fig.update_layout(margin=dict(l=0, r=0, t=36, b=0), height=260,
                           coloraxis_showscale=False)
         st.plotly_chart(fig, use_container_width=True)
     st.subheader("Gap history")
     fig2 = px.line(gaps.sort_values("date"), x="date", y="gap_bps",
                    color="fam_a", facet_col="fam_b", template="plotly_dark",
-                   title="Parity gap history (bps)", labels={"gap_bps":"bps","date":""})
-    fig2.update_layout(margin=dict(t=40,b=0), height=320)
+                   title="Parity gap history (bps)", labels={"gap_bps": "bps", "date": ""})
+    fig2.update_layout(margin=dict(t=40, b=0), height=320)
     st.plotly_chart(fig2, use_container_width=True)
 
 
@@ -171,23 +283,23 @@ def _page_curve() -> None:
         fig = px.line(lc[lc["traded"]], x="dte", y="ln_px_fine", color="family",
                       markers=True, template="plotly_dark",
                       title=f"Term structure {str(latest_date)[:10]}",
-                      labels={"dte":"Days to expiry","ln_px_fine":"ln(price/fine g)"})
-        fig.update_layout(margin=dict(t=40,b=0), height=320)
+                      labels={"dte": "Days to expiry", "ln_px_fine": "ln(price/fine g)"})
+        fig.update_layout(margin=dict(t=40, b=0), height=320)
         st.plotly_chart(fig, use_container_width=True)
     with col_b:
         if factor is not None and not factor.empty:
             fig_g = px.line(factor, x="date", y="G", template="plotly_dark",
                             title="Gold factor G (INR/fine gram)",
-                            labels={"G":"G (INR)","date":""})
-            fig_g.update_layout(margin=dict(t=40,b=0), height=320)
+                            labels={"G": "G (INR)", "date": ""})
+            fig_g.update_layout(margin=dict(t=40, b=0), height=320)
             st.plotly_chart(fig_g, use_container_width=True)
     if "implied_carry_ann" in curves.columns:
         carry = curves[curves["implied_carry_ann"].notna()]
         if not carry.empty:
             fig_c = px.line(carry, x="date", y="implied_carry_ann", color="family",
                             template="plotly_dark", title="Implied annualised carry",
-                            labels={"implied_carry_ann":"Carry (ann.)","date":""})
-            fig_c.update_layout(margin=dict(t=40,b=0), height=300)
+                            labels={"implied_carry_ann": "Carry (ann.)", "date": ""})
+            fig_c.update_layout(margin=dict(t=40, b=0), height=300)
             st.plotly_chart(fig_c, use_container_width=True)
 
 def _page_lifecycle() -> None:
@@ -217,7 +329,7 @@ def _page_lifecycle() -> None:
                               y="Contract", color="Symbol", template="plotly_dark",
                               title="Contract active trading windows")
             fig.update_yaxes(autorange="reversed")
-            fig.update_layout(margin=dict(t=40,b=0), height=500)
+            fig.update_layout(margin=dict(t=40, b=0), height=500)
             st.plotly_chart(fig, use_container_width=True)
 
 
@@ -250,12 +362,12 @@ def _page_alerts() -> None:
                          color="pair" if "pair" in alerts.columns else "fam_a",
                          size="z" if "z" in alerts.columns else None,
                          template="plotly_dark", title="Alert timeline")
-        fig.update_layout(margin=dict(t=40,b=0), height=300)
+        fig.update_layout(margin=dict(t=40, b=0), height=300)
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.success(
             "\U0001f910 **No alerts fired.** No gap survived all gates after costs. "
-            "This is a valid, honest result — the system is working correctly."
+            "This is a valid, honest result -- the system is working correctly."
         )
     if "blocked_by" in no_sig.columns:
         st.subheader("Gate blocking breakdown")
@@ -264,12 +376,14 @@ def _page_alerts() -> None:
         fig_b = px.bar(blk, x="Count", y="Gate", orientation="h",
                        color="Count", color_continuous_scale="Blues",
                        template="plotly_dark", title="Why signals were blocked")
-        fig_b.update_layout(margin=dict(t=40,b=0), height=260,
+        fig_b.update_layout(margin=dict(t=40, b=0), height=260,
                              coloraxis_showscale=False)
         st.plotly_chart(fig_b, use_container_width=True)
     with st.expander(f"\U0001f4cb No-signal log ({len(no_sig)} records, last 200)"):
-        show = [c for c in ["date","pair","fam_a","fam_b","blocked_by","gap_bps","z","net_edge_bps"] if c in no_sig.columns]
+        show = [c for c in ["date", "pair", "fam_a", "fam_b", "blocked_by",
+                             "gap_bps", "z", "net_edge_bps"] if c in no_sig.columns]
         st.dataframe(no_sig[show].tail(200), use_container_width=True, hide_index=True)
+
 
 def _page_backtest() -> None:
     _hdr("\U0001f9ea Backtest Lab",
@@ -354,9 +468,12 @@ def _page_backtest() -> None:
             if not sl.empty:
                 st.subheader("Slippage stress test")
                 fig_sl = px.bar(sl, x="slippage_multiplier", y="net_pnl",
-                                color="net_pnl", color_continuous_scale=["#EF553B", "#00CC96"],
-                                template="plotly_dark", title="Net P&L vs slippage multiplier",
-                                labels={"slippage_multiplier": "Multiplier", "net_pnl": "Net P&L"})
+                                color="net_pnl",
+                                color_continuous_scale=["#EF553B", "#00CC96"],
+                                template="plotly_dark",
+                                title="Net P&L vs slippage multiplier",
+                                labels={"slippage_multiplier": "Multiplier",
+                                        "net_pnl": "Net P&L"})
                 fig_sl.update_layout(margin=dict(t=40, b=0), height=280,
                                      coloraxis_showscale=False)
                 st.plotly_chart(fig_sl, use_container_width=True)
@@ -391,7 +508,8 @@ def _page_health() -> None:
     col_a, col_b = st.columns(2)
     with col_a:
         if "vol_g" in panel.columns:
-            vol = panel[panel["vol_g"] > 0].groupby(["date", "symbol"])["vol_g"].sum().reset_index()
+            vol = (panel[panel["vol_g"] > 0]
+                   .groupby(["date", "symbol"])["vol_g"].sum().reset_index())
             fig = px.line(vol, x="date", y="vol_g", color="symbol",
                           template="plotly_dark", title="Daily volume (grams)",
                           labels={"vol_g": "Volume (g)", "date": ""})
@@ -420,7 +538,17 @@ def main() -> None:
             "<div class='synth'>"
             "\U0001f534 <strong>SYNTHETIC DATA</strong> -- "
             "All numbers are from the synthetic generator and do not represent real MCX prices. "
-            "Run <code>edge-ai fetch</code> and <code>edge-ai build</code> to load real data."
+            "Paste your MCX cURL into <code>docs/bhavcopy_request.curl</code>, "
+            "then click <b>Fetch Today &amp; Rebuild</b> in the sidebar to load real data."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='live-badge'>"
+            "\U0001f7e2 <strong>LIVE MCX DATA</strong> -- "
+            f"Showing real MCX Bhavcopy data. Latest: <b>{_latest_date()}</b>. "
+            "Use the sidebar to refresh."
             "</div>",
             unsafe_allow_html=True,
         )
