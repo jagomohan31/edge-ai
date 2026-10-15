@@ -22,7 +22,7 @@ def _is_synthetic() -> bool:
 def main() -> None:
     st.set_page_config(
         page_title="Edge AI — MCX Gold Analytics",
-        page_icon="gold",
+        page_icon="🥇",
         layout="wide",
     )
 
@@ -30,7 +30,7 @@ def main() -> None:
         st.error(
             "SYNTHETIC DATA — All numbers on this dashboard are from the synthetic "
             "generator and do not represent real MCX prices. Fetch real data to remove this banner.",
-            icon="red_circle",
+            icon="🔴",
         )
 
     st.title("Edge AI — MCX Gold Futures Analytics")
