@@ -1,11 +1,11 @@
-"""normalize.py: price per fine gram, maturity-matched parity gaps.
+"""normalize.py: price per fine gram, maturity-matched parity gaps (Req 3).
 
-Requirement 3:
-- px_g_fine = close / quote_g / fineness
-- ln_price_at: interpolate ln(px_g_fine) along DTE; extrapolate up to max_extrapolation_days
-- gap_bps = 1e4 * (ln_price_at(A, dte_B) - ln(px_B))
+Reference implementations from edge_ai_ref.py: normalize_panel, ln_price_at,
+parity_row, build_gaps.  These are the exact reference functions adapted to use
+the Config object instead of the CONTRACTS dict.
 
-Golden test: 83 bps naive -> 43 bps after purity -> ~-9 bps after carry.
+Golden test: 83 bps naive -> 40.1 bps purity + 51.8 bps maturity + (-8.9) bps residual.
+Identity: naive_bps == purity_bps + maturity_bps + gap_bps  (exact, by construction).
 """
 from __future__ import annotations
 
@@ -14,116 +14,130 @@ import pandas as pd
 
 from edge_ai.config import Config
 
+# Canonical pair list: (A smaller/newer family, B larger/older family)
+PAIRS = [
+    ("GOLDTEN",    "GOLDM"),
+    ("GOLDGUINEA", "GOLDM"),
+    ("GOLDPETAL",  "GOLDM"),
+    ("GOLDGUINEA", "GOLDTEN"),
+    ("GOLDPETAL",  "GOLDTEN"),
+    ("GOLDPETAL",  "GOLDGUINEA"),
+]
 
-def ln_price_at(
-    curve_df: pd.DataFrame,
-    target_dte: float,
-    max_extrapolation_days: int,
-) -> float | None:
-    """Interpolate ln(px_g_fine) at target_dte from a family's traded curve.
 
-    curve_df must have columns: dte, ln_px_fine (sorted by dte ascending).
-    Returns None if target_dte is out of range by more than max_extrapolation_days.
+def normalize_panel(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Add normalised columns to the raw panel.
+
+    Adds: lot_g, quote_g, fineness, dte, px_g, px_g_fine, vol_g, oi_g, traded, ln_px_fine,
+    zero_vol, stale (stub -- always False until real stale detection is implemented).
     """
-    df = curve_df.dropna(subset=["dte", "ln_px_fine"]).sort_values("dte")
-    if len(df) < 2:
+    contracts = cfg.contracts
+    rows = df.copy()
+
+    lot_g     = rows["symbol"].map({s: c.lot_g    for s, c in contracts.items()})
+    quote_g   = rows["symbol"].map({s: c.quote_g  for s, c in contracts.items()})
+    fineness  = rows["symbol"].map({s: c.fineness for s, c in contracts.items()})
+
+    rows["lot_g"]      = lot_g
+    rows["quote_g"]    = quote_g
+    rows["fineness"]   = fineness
+    rows["dte"]        = (rows["expiry"] - rows["date"]).dt.days.astype(int)
+    rows["px_g"]       = rows["close"] / rows["quote_g"]           # INR per quoted gram
+    rows["px_g_fine"]  = rows["px_g"] / rows["fineness"]           # INR per fine gram
+    rows["vol_g"]      = rows["volume"] * rows["lot_g"]            # traded grams
+    rows["oi_g"]       = rows["oi"]     * rows["lot_g"]
+    rows["traded"]     = rows["volume"] > 0
+    rows["ln_px_fine"] = np.log(rows["px_g_fine"])
+    rows["zero_vol"]   = rows["volume"] == 0
+    rows["stale"]      = False   # TODO: implement unchanged-close-while-neighbours-moved
+
+    return rows
+
+
+def ln_price_at(curve: pd.DataFrame, target_dte: float, max_gap: float = 7.0) -> float:
+    """Interpolate ln(px_g_fine) along DTE for ONE family on ONE date.
+
+    curve: rows with columns dte, px_g_fine (traded expiries of one family, one date).
+    Extrapolates at most max_gap days beyond the observed range; returns nan otherwise.
+    Reference: edge_ai_ref.py::ln_price_at (exact copy, parameter name aligned).
+    """
+    c = curve.sort_values("dte")
+    x = c["dte"].to_numpy(float)
+    y = np.log(c["px_g_fine"].to_numpy(float))
+    if len(x) < 2:
+        return np.nan
+    if x[0] <= target_dte <= x[-1]:
+        return float(np.interp(target_dte, x, y))
+    # Extrapolation: use the near-end slope
+    k, j = (0, 1) if target_dte < x[0] else (-1, -2)
+    if abs(target_dte - x[k]) > max_gap:
+        return np.nan
+    return float(y[k] + (y[k] - y[j]) / (x[k] - x[j]) * (target_dte - x[k]))
+
+
+def parity_row(
+    day: pd.DataFrame,
+    fam_a: str,
+    fam_b: str,
+    expiry_b,
+    max_leg_gap_days: int = 7,
+    max_extrap_days: float = 7.0,
+):
+    """Gap of family A vs ONE contract of family B, decomposed into purity/maturity/residual.
+
+    naive = purity + maturity + residual  (exact identity, no rounding).
+    gap_bps = residual = the carry-adjusted, purity-adjusted relative-value gap.
+
+    Returns None if the gap cannot be computed (not enough traded expiries in A,
+    or the nearest A expiry is too far from expiry_b, or extrapolation limit exceeded).
+
+    Reference: edge_ai_ref.py::parity_row (exact copy).
+    """
+    b_rows = day[(day["symbol"] == fam_b) & (day["expiry"] == expiry_b) & day["traded"]]
+    a_all  = day[(day["symbol"] == fam_a) & day["traded"]]
+    if b_rows.empty or len(a_all) < 2:
         return None
+    b = b_rows.iloc[0]
+    gaps = (a_all["expiry"] - expiry_b).abs().dt.days
+    if gaps.min() > max_leg_gap_days:
+        return None
+    leg = a_all.loc[gaps.idxmin()]                        # tradable A contract nearest to B expiry
+    ln_a_at_b = ln_price_at(a_all, float(b["dte"]), max_extrap_days)
+    if np.isnan(ln_a_at_b):
+        return None
+    naive    = 1e4 * np.log(leg["px_g"]      / b["px_g"])
+    purity   = 1e4 * np.log(leg["fineness"]  / b["fineness"])
+    maturity = 1e4 * (np.log(leg["px_g_fine"]) - ln_a_at_b)
+    resid    = 1e4 * (ln_a_at_b - np.log(b["px_g_fine"]))
+    return dict(
+        date=b["date"], fam_a=fam_a, fam_b=fam_b,
+        expiry_a=leg["expiry"], expiry_b=expiry_b,
+        dte_a=int(leg["dte"]), dte_b=int(b["dte"]),
+        naive_bps=float(naive), purity_bps=float(purity),
+        maturity_bps=float(maturity), gap_bps=float(resid),
+        px_a=float(leg["close"]), px_b=float(b["close"]),
+        vol_g_a=float(leg["vol_g"]), vol_g_b=float(b["vol_g"]),
+        leg_gap_days=int(abs((leg["expiry"] - expiry_b).days)),
+        liq_ok_a=bool(leg["traded"]), liq_ok_b=bool(b["traded"]),
+        stale=bool(b["stale"]),
+    )
 
-    dte_arr = df["dte"].values.astype(float)
-    ln_arr = df["ln_px_fine"].values.astype(float)
 
-    min_dte, max_dte = dte_arr[0], dte_arr[-1]
+def build_gaps(pn: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Build one parity row per (date, pair, B expiry) across all configured pairs.
 
-    if min_dte <= target_dte <= max_dte:
-        return float(np.interp(target_dte, dte_arr, ln_arr))
-
-    # Extrapolation
-    if target_dte < min_dte:
-        if min_dte - target_dte > max_extrapolation_days:
-            return None
-        # End slope at min
-        slope = (ln_arr[1] - ln_arr[0]) / (dte_arr[1] - dte_arr[0]) if len(dte_arr) > 1 else 0.0
-        return float(ln_arr[0] + slope * (target_dte - dte_arr[0]))
-    else:
-        if target_dte - max_dte > max_extrapolation_days:
-            return None
-        slope = (ln_arr[-1] - ln_arr[-2]) / (dte_arr[-1] - dte_arr[-2]) if len(dte_arr) > 1 else 0.0
-        return float(ln_arr[-1] + slope * (target_dte - dte_arr[-1]))
-
-
-def compute_gaps(panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Compute maturity-matched parity gaps across all symbol pairs.
-
-    For each trading date and pair (fam_a, fam_b):
-    gap_bps = 1e4 * (ln_price_at(A, dte_B) - ln(px_g_fine_B))
-
-    Returns a DataFrame with columns:
-    date, fam_a, fam_b, expiry_b, dte_b, gap_bps, extrap_days, liq_ok_a, liq_ok_b, stale
+    Uses the canonical PAIRS list.  Returns a DataFrame with columns from parity_row
+    plus computed extras used downstream by signals.
     """
-    symbols = cfg.data.symbols
-    max_extrap = cfg.curve.max_extrapolation_days
-    max_maturity_gap = cfg.signals.max_maturity_gap_days
-
-    if "ln_px_fine" not in panel.columns:
-        panel = panel.copy()
-        panel["ln_px_fine"] = np.log(panel["px_g_fine"])
-
-    records: list[dict] = []
-
-    for date_val, day_df in panel.groupby("date"):
-        # Build per-family curves (traded expiries only, non-zero vol)
-        family_curves: dict[str, pd.DataFrame] = {}
-        for sym in symbols:
-            sym_df = day_df[
-                (day_df["symbol"] == sym) & (~day_df["zero_vol"])
-            ][["dte", "ln_px_fine", "expiry"]].dropna().sort_values("dte")
-            if len(sym_df) >= 2:
-                family_curves[sym] = sym_df
-
-        # Pairwise gaps
-        for i, fam_a in enumerate(symbols):
-            for fam_b in symbols[i + 1:]:
-                if fam_a not in family_curves or fam_b not in family_curves:
-                    continue
-
-                curve_a = family_curves[fam_a]
-
-                # For each expiry in B, compute gap
-                for _, row_b in day_df[day_df["symbol"] == fam_b].iterrows():
-                    dte_b = row_b["dte"]
-                    ln_b = row_b["ln_px_fine"]
-                    if pd.isna(ln_b) or pd.isna(dte_b):
-                        continue
-
-                    # Check maturity gap: closest A expiry to B expiry
-                    dte_a_arr = curve_a["dte"].values
-                    nearest_idx = int(np.argmin(np.abs(dte_a_arr - dte_b)))
-                    maturity_gap = abs(float(dte_a_arr[nearest_idx]) - float(dte_b))
-                    if maturity_gap > max_maturity_gap:
-                        continue
-
-                    ln_a_interp = ln_price_at(curve_a, float(dte_b), max_extrap)
-                    if ln_a_interp is None:
-                        continue
-
-                    gap_bps = 1e4 * (ln_a_interp - ln_b)
-                    extrap = max(0.0, float(dte_b) - curve_a["dte"].max()) if float(dte_b) > curve_a["dte"].max() else max(0.0, curve_a["dte"].min() - float(dte_b))
-
-                    liq_ok_a = not day_df[day_df["symbol"] == fam_a]["zero_vol"].all()
-                    liq_ok_b = not row_b["zero_vol"]
-                    stale = bool(row_b.get("stale", False))
-
-                    records.append({
-                        "date": date_val,
-                        "fam_a": fam_a,
-                        "fam_b": fam_b,
-                        "expiry_b": row_b["expiry"],
-                        "dte_b": dte_b,
-                        "gap_bps": gap_bps,
-                        "extrap_days": extrap,
-                        "liq_ok_a": liq_ok_a,
-                        "liq_ok_b": liq_ok_b,
-                        "stale": stale,
-                    })
-
-    return pd.DataFrame(records)
+    max_leg_gap = cfg.signals.max_maturity_gap_days
+    max_extrap  = cfg.curve.max_extrapolation_days
+    out = []
+    for _, day in pn.groupby("date", sort=True):
+        for fam_a, fam_b in PAIRS:
+            # Skip pairs where either family has no data on this date
+            b_expiries = day.loc[(day["symbol"] == fam_b) & day["traded"], "expiry"].unique()
+            for expiry_b in b_expiries:
+                r = parity_row(day, fam_a, fam_b, expiry_b, max_leg_gap, max_extrap)
+                if r is not None:
+                    out.append(r)
+    return pd.DataFrame(out) if out else pd.DataFrame()

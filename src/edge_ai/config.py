@@ -32,12 +32,15 @@ class CurveConfig(BaseModel):
 
 class SignalsConfig(BaseModel):
     baseline_window: int = 60
+    min_obs: int = 20              # minimum observations before baseline is valid
+    floor_bps: float = 0.5         # minimum MAD scale
     dte_buckets: list[int] = Field(default_factory=lambda: [0, 5, 10, 20, 40, 400])
     z_threshold: float = 2.0
     min_net_edge_bps: float = 2.0
     cooldown_sessions: int = 5
     max_maturity_gap_days: int = 7
-    holding_horizon_sessions: int = 5
+    holding_horizon_sessions: int = 5  # also used as horizon for k estimation
+    exit_z: float = 0.5            # exit when |z| falls back to this level
     stop_z: float = 4.0
 
 
@@ -45,6 +48,7 @@ class LiquidityConfig(BaseModel):
     min_traded_g_quantile: float = 0.25
     min_oi_g_quantile: float = 0.25
     max_participation: float = 0.10
+    liq_min_rows: int = 60         # min past rows before liquidity threshold is non-NaN
 
 
 class LifecycleConfig(BaseModel):
@@ -80,11 +84,12 @@ class BacktestConfig(BaseModel):
     split: SplitConfig = Field(default_factory=SplitConfig)
     basket_g: float = 200.0
     basket_multiples: int = 1
+    max_open: int = 3              # max simultaneous open trades
 
 
 class StatsConfig(BaseModel):
     bootstrap_resamples: int = 10000
-    placebo_draws: int = 1000
+    placebo_draws: int = 200       # matches reference default
     seed: int = 42
 
 

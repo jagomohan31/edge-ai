@@ -1,184 +1,252 @@
-"""signals.py: robust z-score signals, alerts, and no-signal records (Req 5).
+"""signals.py: robust z-score baselines, alerts, no-signal records (Req 5).
 
-Past-only baselines: median and MAD over baseline_window sessions (no lookahead).
-Alert fires only when ALL gates pass.
-Quiet by default -- every day writes either an alert or a "no signal" record.
+Reference implementations from edge_ai_ref.py / edge_ai_pipeline.py:
+  mad_scale, walk_forward_baseline, estimate_reversion_k,
+  passes_gates, build_signals, find_alerts.
+
+Past-only: every baseline uses data strictly before the current date.
+Quiet by default: every row has alert=True or alert=False + blocked_by reason.
 """
 from __future__ import annotations
-
-import math
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 from edge_ai.config import Config
+from edge_ai.normalize import build_gaps
+
+# ------------------------------------------------------------------ primitives
+
+def mad_scale(h: np.ndarray) -> tuple[float, float]:
+    """Return (median, 1.4826 * MAD).  Reference: edge_ai_ref.py::mad_scale."""
+    med = float(np.median(h))
+    return med, float(1.4826 * np.median(np.abs(h - med)))
 
 
-@dataclass
-class SignalRecord:
-    """One signal record per (date, pair, expiry_b)."""
+def walk_forward_baseline(
+    obs: pd.DataFrame,
+    window: int = 60,
+    min_obs: int = 20,
+    floor_bps: float = 0.5,
+) -> pd.DataFrame:
+    """Add baseline, scale, z columns to obs using strictly past data.
 
-    date: object
-    fam_a: str
-    fam_b: str
-    expiry_b: object
-    dte_b: float
-    gap_bps: float
-    baseline_bps: float
-    scale_bps: float
-    z: float
-    alert: bool
-    nearest_miss_gate: str  # which gate blocked (if not alert)
-    net_edge_bps: float
-    cost_bps: float
-    liq_ok: bool
-    stale: bool
-
-
-def _dte_bucket(dte: float, buckets: list[int]) -> int:
-    """Return the bucket index for a given DTE."""
-    for i in range(len(buckets) - 1):
-        if buckets[i] <= dte < buckets[i + 1]:
-            return i
-    return len(buckets) - 2
-
-
-def _robust_z(gap: float, history: np.ndarray) -> tuple[float, float, float]:
-    """Compute robust z-score, baseline, and scale from historical gaps."""
-    if len(history) == 0:
-        return float("nan"), float("nan"), float("nan")
-    baseline = float(np.median(history))
-    mad = float(np.median(np.abs(history - baseline)))
-    scale = 1.4826 * mad if mad > 0 else 1e-6
-    z = (gap - baseline) / scale
-    return z, baseline, scale
-
-
-def compute_signals(
-    gaps_df: pd.DataFrame,
-    panel: pd.DataFrame,
-    cfg: Config,
-    liquidity_thresholds: dict | None = None,
-    develop_mask: pd.Series | None = None,
-) -> list[SignalRecord]:
-    """Compute signal records for every (date, pair, expiry_b).
-
-    Uses past-only baselines (no lookahead). Returns list of SignalRecord.
+    obs columns: date, key (pair + DTE bucket), gap_bps.
+    For each row the baseline uses only observations of the same key on strictly
+    earlier dates.  Reference: edge_ai_ref.py::walk_forward_baseline (exact copy).
     """
-    from edge_ai.costs import round_trip_cost_bps
+    obs = obs.sort_values("date").copy()
+    base  = pd.Series(np.nan, index=obs.index)
+    scale = pd.Series(np.nan, index=obs.index)
+    for _, g in obs.groupby("key", sort=False):
+        hist: list[float] = []
+        for _, day in g.groupby("date", sort=True):
+            h = np.asarray(hist[-window:])
+            if len(h) >= min_obs:
+                med, s = mad_scale(h)
+                base.loc[day.index]  = med
+                scale.loc[day.index] = max(s, floor_bps)
+            hist.extend(day["gap_bps"].tolist())
+    obs["baseline"] = base
+    obs["scale"]    = scale
+    obs["z"] = (obs["gap_bps"] - obs["baseline"]) / obs["scale"]
+    return obs
 
-    baseline_window = cfg.signals.baseline_window
-    dte_buckets = cfg.signals.dte_buckets
-    z_threshold = cfg.signals.z_threshold
-    min_net_edge = cfg.signals.min_net_edge_bps
-    cooldown = cfg.signals.cooldown_sessions
-    delivery_cutoff = cfg.lifecycle.delivery_cutoff_sessions
 
-    cooldown_tracker: dict[tuple, int] = {}  # (fam_a, fam_b, expiry_b) -> last alert session_idx
-    records: list[SignalRecord] = []
+def estimate_reversion_k(obs: pd.DataFrame, horizon: int, develop_end) -> float:
+    """Fraction of the deviation that reverts within `horizon` observations.
 
-    # Map date -> session_idx
-    date_to_idx = {}
-    if "session_idx" in panel.columns:
-        date_to_idx = panel.drop_duplicates("date").set_index("date")["session_idx"].to_dict()
+    Estimated on the DEVELOP window only: k = -sum(dev*delta)/sum(dev^2),
+    clipped to [0, 1].  obs needs series_id, date, gap_bps, baseline.
+    Reference: edge_ai_ref.py::estimate_reversion_k (exact copy).
+    """
+    d = obs.sort_values(["series_id", "date"]).copy()
+    d["delta"] = d.groupby("series_id")["gap_bps"].shift(-horizon) - d["gap_bps"]
+    d["dev"]   = d["gap_bps"] - d["baseline"]
+    d = d[d["date"] <= develop_end].dropna(subset=["delta", "dev"])
+    if d.empty or (d["dev"] ** 2).sum() == 0:
+        return 0.0
+    return float(np.clip(-(d["dev"] * d["delta"]).sum() / (d["dev"] ** 2).sum(), 0.0, 1.0))
 
-    sorted_dates = sorted(gaps_df["date"].unique())
 
-    for date_val in sorted_dates:
-        session_idx = date_to_idx.get(date_val, 0)
-        day_gaps = gaps_df[gaps_df["date"] == date_val]
+def passes_gates(row: dict, cfg_dict: dict) -> tuple[bool, str]:
+    """First failing gate wins. Returns (passed, gate_name).
 
-        for _, row in day_gaps.iterrows():
-            pair_key = (row["fam_a"], row["fam_b"], row["expiry_b"])
-            dte_b = float(row["dte_b"])
-            gap = float(row["gap_bps"])
-            bucket = _dte_bucket(dte_b, dte_buckets)
+    row keys: z, net_edge_bps, liq_ok, sessions_to_expiry, stale, leg_gap_days.
+    Reference: edge_ai_ref.py::passes_gates (exact copy).
+    """
+    if not np.isfinite(row["z"]) or abs(row["z"]) < cfg_dict["z_threshold"]:
+        return False, "z below threshold"
+    if row["stale"]:
+        return False, "stale print"
+    if not row["liq_ok"]:
+        return False, "liquidity gate"
+    if row["sessions_to_expiry"] <= cfg_dict["delivery_cutoff_sessions"] + 1:
+        return False, "inside delivery cutoff"
+    if row["leg_gap_days"] > cfg_dict["max_maturity_gap_days"]:
+        return False, "maturity gap too large"
+    if row["net_edge_bps"] < cfg_dict["min_net_edge_bps"]:
+        return False, "net edge below minimum"
+    return True, ""
 
-            # Past history for this pair and bucket
-            hist = gaps_df[
-                (gaps_df["date"] < date_val)
-                & (gaps_df["fam_a"] == row["fam_a"])
-                & (gaps_df["fam_b"] == row["fam_b"])
-            ]
-            if "dte_b" in hist.columns:
-                hist_b = hist[hist["dte_b"].apply(lambda d: _dte_bucket(float(d), dte_buckets)) == bucket]
-            else:
-                hist_b = hist
-            hist_window = hist_b.tail(baseline_window)["gap_bps"].values.astype(float)
 
-            z, baseline, scale = _robust_z(gap, hist_window)
+def sessions_to_expiry(sessions: np.ndarray, t, expiry) -> int:
+    """Number of sessions strictly after t up to and including expiry.
 
-            # Cost estimate (simplified: use mid-price from panel)
-            fam_a_rows = panel[(panel["date"] == date_val) & (panel["symbol"] == row["fam_a"])]
-            fam_b_rows = panel[(panel["date"] == date_val) & (panel["symbol"] == row["fam_b"])]
-            cost_bps = float("nan")
-            if not fam_a_rows.empty and not fam_b_rows.empty:
-                from edge_ai.spec import gram_basket
-                alloc_a = gram_basket(cfg.backtest.basket_g, row["fam_a"], cfg)
-                alloc_b = gram_basket(cfg.backtest.basket_g, row["fam_b"], cfg)
-                try:
-                    cost_bps = round_trip_cost_bps(
-                        float(fam_a_rows["close"].iloc[0]), alloc_a.lots, row["fam_a"],
-                        float(fam_b_rows["close"].iloc[0]), alloc_b.lots, row["fam_b"],
-                        cfg,
-                    )
-                except Exception:
-                    cost_bps = float("nan")
+    Reference: edge_ai_ref.py::sessions_to_expiry (exact copy).
+    """
+    s = pd.to_datetime(sessions).to_numpy()
+    return int(
+        np.searchsorted(s, np.datetime64(pd.Timestamp(expiry)), side="right")
+        - np.searchsorted(s, np.datetime64(pd.Timestamp(t)), side="right")
+    )
 
-            # Expected convergence: median gap change over holding horizon for similar deviations
-            net_edge = abs(gap - (baseline if not math.isnan(baseline) else 0)) - (cost_bps if not math.isnan(cost_bps) else 0)
 
-            liq_ok = bool(row.get("liq_ok_a", True)) and bool(row.get("liq_ok_b", True))
-            stale = bool(row.get("stale", False))
+# ------------------------------------------------------------------ pipeline helpers
 
-            # Gate checks
-            gates_passed = True
-            nearest_miss = ""
+def _round_trip_cost_bps(
+    fam_a: str, px_a: float,
+    fam_b: str, px_b: float,
+    cfg: Config,
+    stress: float = 1.0,
+) -> float:
+    """Round-trip cost as bps of leg-A notional (entry+exit, both legs).
 
-            if math.isnan(z) or abs(z) < z_threshold:
-                gates_passed = False
-                nearest_miss = f"z={z:.2f} < {z_threshold}"
-            elif math.isnan(net_edge) or net_edge < min_net_edge:
-                gates_passed = False
-                nearest_miss = f"net_edge={net_edge:.2f} < {min_net_edge}"
-            elif not liq_ok:
-                gates_passed = False
-                nearest_miss = "liquidity_gate"
-            elif dte_b < delivery_cutoff:
-                gates_passed = False
-                nearest_miss = f"dte_b={dte_b:.0f} < delivery_cutoff={delivery_cutoff}"
-            elif stale:
-                gates_passed = False
-                nearest_miss = "stale_price"
-            elif row.get("extrap_days", 0) > cfg.signals.max_maturity_gap_days:
-                gates_passed = False
-                nearest_miss = "maturity_gap"
-            elif pair_key in cooldown_tracker:
-                sessions_since = session_idx - cooldown_tracker[pair_key]
-                if sessions_since < cooldown:
-                    gates_passed = False
-                    nearest_miss = f"cooldown ({sessions_since}/{cooldown} sessions)"
+    Reference: edge_ai_pipeline.py::round_trip_cost_bps adapted to Config.
+    """
+    from edge_ai.costs import cost_per_leg
+    basket_g   = cfg.backtest.basket_g
+    ca         = cfg.contracts[fam_a]
+    cb         = cfg.contracts[fam_b]
+    lots_a     = basket_g // ca.lot_g
+    lots_b     = basket_g // cb.lot_g
+    notional_a = px_a * ca.lot_g / ca.quote_g * lots_a
 
-            if gates_passed:
-                cooldown_tracker[pair_key] = session_idx
+    total = sum(
+        cost_per_leg(px, lots, sym, side, cfg, stress)["total_inr"]
+        for sym, px, lots, side in [
+            (fam_a, px_a, lots_a, "sell"),
+            (fam_b, px_b, lots_b, "buy"),
+            (fam_a, px_a, lots_a, "buy"),
+            (fam_b, px_b, lots_b, "sell"),
+        ]
+    )
+    return 1e4 * total / notional_a if notional_a > 0 else float("nan")
 
-            records.append(SignalRecord(
-                date=date_val,
-                fam_a=row["fam_a"],
-                fam_b=row["fam_b"],
-                expiry_b=row["expiry_b"],
-                dte_b=dte_b,
-                gap_bps=gap,
-                baseline_bps=baseline,
-                scale_bps=scale,
-                z=z,
-                alert=gates_passed,
-                nearest_miss_gate=nearest_miss,
-                net_edge_bps=net_edge,
-                cost_bps=cost_bps,
-                liq_ok=liq_ok,
-                stale=stale,
-            ))
 
-    return records
+def _past_only_liquidity_thresholds(pn: pd.DataFrame, q: float = 0.25, min_rows: int = 60) -> dict:
+    """q-quantile of traded grams per (date, symbol) using STRICTLY earlier dates.
+
+    NaN until min_rows rows exist -- prevents look-ahead and handles GOLDTEN's short history.
+    Reference: edge_ai_pipeline.py::past_only_liquidity_thresholds (exact copy).
+    """
+    import bisect
+    hist: dict[str, list] = {s: [] for s in pn["symbol"].unique()}
+    out: dict = {}
+    for d, day in pn.groupby("date", sort=True):
+        for s, h in hist.items():
+            out[(d, s)] = h[int(q * (len(h) - 1))] if len(h) >= min_rows else np.nan
+        for s, v in zip(day.loc[day["traded"], "symbol"], day.loc[day["traded"], "vol_g"], strict=False):
+            bisect.insort(hist[s], float(v))
+    return out
+
+
+def _split_sessions(sessions, cfg: Config):
+    """Return (develop_end date) for the develop window (60% of sessions)."""
+    n = len(sessions)
+    develop_end = pd.Timestamp(sessions[int(0.6 * n) - 1])
+    return develop_end
+
+
+# ------------------------------------------------------------------ main pipeline
+
+def build_signals(gaps: pd.DataFrame, pn: pd.DataFrame, cfg: Config, develop_end) -> pd.DataFrame:
+    """Add baseline, k, expected_conv_bps, cost_bps, net_edge_bps, liq_ok, sessions_to_expiry.
+
+    Uses past-only baselines and past-only liquidity thresholds.
+    Reference: edge_ai_pipeline.py::build_signals adapted to Config.
+    """
+    p = cfg.signals
+    g = gaps.copy()
+    g["pair"]      = g["fam_a"] + "/" + g["fam_b"]
+    g["bucket"]    = pd.cut(
+        g["dte_b"], p.dte_buckets, right=False, labels=False
+    ).astype(float)
+    g["key"]       = g["pair"] + "|" + g["bucket"].astype(str)
+    g["series_id"] = g["pair"] + "|" + g["expiry_b"].dt.strftime("%Y%m%d")
+
+    g = walk_forward_baseline(g, p.baseline_window, p.min_obs, p.floor_bps)
+
+    k = estimate_reversion_k(g, p.holding_horizon_sessions, develop_end)
+    g["dev"]              = g["gap_bps"] - g["baseline"]
+    g["expected_conv_bps"] = k * g["dev"].abs()
+    g["cost_bps"] = [
+        _round_trip_cost_bps(a, pa, b, pb, cfg)
+        for a, pa, b, pb in zip(g["fam_a"], g["px_a"], g["fam_b"], g["px_b"], strict=False)
+    ]
+    g["net_edge_bps"] = g["expected_conv_bps"] - g["cost_bps"]
+    g["k"] = k
+
+    thr = _past_only_liquidity_thresholds(
+        pn, cfg.liquidity.min_traded_g_quantile, cfg.liquidity.liq_min_rows
+    )
+    g["thr_a"] = [thr.get((d, s), np.nan) for d, s in zip(g["date"], g["fam_a"], strict=False)]
+    g["thr_b"] = [thr.get((d, s), np.nan) for d, s in zip(g["date"], g["fam_b"], strict=False)]
+    g["liq_ok"] = (g["vol_g_a"] >= g["thr_a"]) & (g["vol_g_b"] >= g["thr_b"])
+
+    sessions_arr = np.sort(pn["date"].unique())
+    g["sessions_to_expiry"] = [
+        min(sessions_to_expiry(sessions_arr, d, ea),
+            sessions_to_expiry(sessions_arr, d, eb))
+        for d, ea, eb in zip(g["date"], g["expiry_a"], g["expiry_b"], strict=False)
+    ]
+
+    if "stale" not in g.columns:
+        g["stale"] = False
+
+    return g.sort_values(["date", "series_id"]).reset_index(drop=True)
+
+
+def find_alerts(g: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Apply gates + per-series cooldown.  Returns g with alert and blocked_by columns.
+
+    Reference: edge_ai_pipeline.py::find_alerts adapted to Config.
+    """
+    p = cfg.signals
+    cfg_dict = dict(
+        z_threshold=p.z_threshold,
+        min_net_edge_bps=p.min_net_edge_bps,
+        delivery_cutoff_sessions=cfg.lifecycle.delivery_cutoff_sessions,
+        max_maturity_gap_days=p.max_maturity_gap_days,
+    )
+    keep, reasons = [], []
+    sess_idx = {d: i for i, d in enumerate(np.sort(g["date"].unique()))}
+    last: dict[str, int] = {}
+    for row in g.itertuples(index=False):
+        ok, why = passes_gates(row._asdict(), cfg_dict)
+        sid = row.series_id
+        i   = sess_idx[row.date]
+        if ok and sid in last and (i - last[sid]) < p.cooldown_sessions:
+            ok, why = False, "cooldown"
+        if ok:
+            last[sid] = i
+        keep.append(ok)
+        reasons.append(why)
+    out = g.copy()
+    out["alert"]      = keep
+    out["blocked_by"] = reasons
+    return out
+
+
+def compute_signals(pn: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Convenience wrapper: gaps -> build_signals -> find_alerts.
+
+    Returns the full signal DataFrame with alert column.
+    """
+    sessions_arr = np.sort(pn["date"].unique())
+    develop_end  = pd.Timestamp(sessions_arr[int(0.6 * len(sessions_arr)) - 1])
+    gaps = build_gaps(pn, cfg)
+    if gaps.empty:
+        return pd.DataFrame()
+    g = build_signals(gaps, pn, cfg, develop_end)
+    return find_alerts(g, cfg)

@@ -1,275 +1,290 @@
 """backtest.py: chronological backtest engine (Req 6).
 
-Fill rules: orders created at close of t fill on t+1.
-Whole-lot baskets, calendar enforcement, participation cap.
+Reference implementations: simulate_trade, make_px, legs_for, run_backtest
+from edge_ai_pipeline.py / edge_ai_ref.py.
+
+Key correctness properties:
+- Signal at close of day t -> fill at NEXT session open (adverse slippage).
+- Exit decided at close of t -> fill at NEXT session open (or current close * 3x if no volume).
+- Every leg priced at its own contract's price.  No continuous series.
+- Rejects fills when volume = 0 or lots > max_participation * volume.
+- Forced exit before delivery_cutoff_sessions.
 """
 from __future__ import annotations
-
-import uuid
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 from edge_ai.config import Config
-from edge_ai.costs import cost_per_leg
-from edge_ai.signals import SignalRecord
-from edge_ai.spec import gram_basket
+from edge_ai.signals import sessions_to_expiry
+
+# ------------------------------------------------------------------ cost helpers (thin wrappers)
+
+def _fill_price(open_px: float, side: str, symbol: str, cfg: Config, stress: float = 1.0) -> float:
+    """Adverse fill at the next session open.  Buys pay up, sells give up.
+
+    Reference: edge_ai_ref.py::fill_price (exact logic).
+    """
+    tick = cfg.contracts[symbol].tick_inr
+    slip = cfg.costs.slippage_ticks_per_side * stress * tick
+    return open_px + slip if side == "buy" else open_px - slip
 
 
-@dataclass
-class Position:
-    """One open two-leg position."""
+def _trade_cost_inr(
+    symbol: str, side: str, price: float, lots: int, cfg: Config,
+    brokerage: bool = True,
+) -> float:
+    """Statutory charges for one leg, one side.
 
-    trade_id: str
-    fam_a: str
-    fam_b: str
-    expiry_b: object
-    lots_a: int
-    lots_b: int
-    entry_date: object
-    fill_date: object
-    entry_px_a: float
-    entry_px_b: float
-    entry_cost_inr: float
-    entry_signal: SignalRecord
-
-
-@dataclass
-class TradeRecord:
-    """Completed round-trip trade."""
-
-    trade_id: str
-    entry_date: object
-    exit_date: object
-    fam_a: str
-    fam_b: str
-    expiry_b: object
-    lots_a: int
-    lots_b: int
-    entry_px_a: float
-    entry_px_b: float
-    exit_px_a: float
-    exit_px_b: float
-    entry_cost_inr: float
-    exit_cost_inr: float
-    gross_pnl_inr: float
-    net_pnl_inr: float
-    exit_reason: str
-    synthetic: bool
+    Reference: edge_ai_ref.py::trade_cost_inr adapted to Config.
+    """
+    c      = cfg.contracts[symbol]
+    cc     = cfg.costs
+    notional = price * (c.lot_g / c.quote_g) * lots
+    brok   = cc.brokerage_per_order_inr if brokerage else 0.0
+    ctt    = notional * cc.ctt_sell    if side == "sell" else 0.0
+    exch   = notional * cc.exchange_txn
+    stamp  = notional * cc.stamp_buy   if side == "buy"  else 0.0
+    sebi   = notional * cc.sebi_per_crore_inr / 1e7
+    gst    = cc.gst * (brok + exch + sebi)
+    return brok + ctt + exch + stamp + sebi + gst
 
 
-def _get_px(panel: pd.DataFrame, date_val: object, symbol: str, expiry: object | None) -> float | None:
-    if expiry is not None:
-        row = panel[(panel["date"] == date_val) & (panel["symbol"] == symbol) & (panel["expiry"] == expiry)]
-    else:
-        cands = panel[(panel["date"] == date_val) & (panel["symbol"] == symbol)]
-        if "dte" in cands.columns:
-            cands = cands[cands["dte"] > 0].sort_values("dte")
-        row = cands
-    if row.empty:
+def _leg_pnl_inr(symbol: str, sign: int, lots: int, p0: float, p1: float, cfg: Config) -> float:
+    """P&L for one leg (sign=+1 long, -1 short).  Reference: edge_ai_ref.py::leg_pnl_inr."""
+    c = cfg.contracts[symbol]
+    return sign * lots * (c.lot_g / c.quote_g) * (p1 - p0)
+
+
+def _fine_gram_exposure(legs: list[dict], cfg: Config) -> float:
+    """Net fine-gram exposure.  Reference: edge_ai_ref.py::fine_gram_exposure."""
+    return sum(
+        L["sign"] * L["lots"] * cfg.contracts[L["symbol"]].lot_g * cfg.contracts[L["symbol"]].fineness
+        for L in legs
+    )
+
+
+# ------------------------------------------------------------------ book helpers
+
+def make_px(pn: pd.DataFrame) -> dict:
+    """Index panel by (symbol, expiry) -> DataFrame[open, close, volume] by date.
+
+    Reference: edge_ai_pipeline.py::make_px (exact copy adapted for column names).
+    """
+    return {
+        k: d.set_index("date")[["open", "close", "volume"]].sort_index()
+        for k, d in pn.groupby(["symbol", "expiry"])
+    }
+
+
+def legs_for(row, basket_g: int, cfg: Config, mult: int = 1) -> list[dict]:
+    """Construct leg list for a signal row.
+
+    Gap above baseline means A is expensive relative to B: short A, long B.
+    Reference: edge_ai_pipeline.py::legs_for adapted to Config.
+    """
+    lots = {s: basket_g // cfg.contracts[s].lot_g for s in cfg.data.symbols}
+    sign_a = -1 if row["dev"] > 0 else +1
+    return [
+        dict(symbol=row["fam_a"], expiry=row["expiry_a"], sign=sign_a,    lots=lots[row["fam_a"]] * mult),
+        dict(symbol=row["fam_b"], expiry=row["expiry_b"], sign=-sign_a,   lots=lots[row["fam_b"]] * mult),
+    ]
+
+
+# ------------------------------------------------------------------ core simulator
+
+def simulate_trade(
+    px: dict,
+    legs: list[dict],
+    signal_date,
+    z_by_date: pd.Series,
+    sessions,
+    cfg: Config,
+    stress: float = 1.0,
+):
+    """Simulate one basket trade from signal to exit.
+
+    Fill rule: signal at close of signal_date -> entry at NEXT session open (adverse slippage).
+    Exit decided at close -> fills at NEXT session open (or at this close * 3x slippage if no volume).
+    Returns None when the entry cannot be filled.
+
+    Reference: edge_ai_ref.py::simulate_trade (exact logic, uses Config instead of cfg dict).
+    """
+    p      = cfg.signals
+    lc     = cfg.lifecycle
+    sess   = pd.to_datetime(sessions)
+    idx    = {d: i for i, d in enumerate(sess)}
+    i0     = idx.get(pd.Timestamp(signal_date))
+    if i0 is None or i0 + 1 >= len(sess):
         return None
-    return float(row["close"].iloc[0])
+
+    def book(L):
+        return px.get((L["symbol"], L["expiry"]))
+
+    t_in = sess[i0 + 1]
+
+    # Check entry fills (volume, participation)
+    entry = {}
+    for k, L in enumerate(legs):
+        d = book(L)
+        if d is None or t_in not in d.index:
+            return None
+        vol = d.loc[t_in, "volume"]
+        if vol <= 0 or L["lots"] > cfg.liquidity.max_participation * vol:
+            return None
+        side = "buy" if L["sign"] > 0 else "sell"
+        entry[k] = _fill_price(d.loc[t_in, "open"], side, L["symbol"], cfg, stress)
+
+    cost = sum(
+        _trade_cost_inr(L["symbol"], "buy" if L["sign"] > 0 else "sell", entry[k], L["lots"], cfg)
+        for k, L in enumerate(legs)
+    )
+    prev = dict(entry)
+    daily, held, k_i = [], 0, i0 + 1
+
+    while True:
+        t = sess[k_i]
+        pnl = 0.0
+        for k, L in enumerate(legs):
+            d = book(L)
+            c = d.loc[t, "close"] if (d is not None and t in d.index) else prev[k]
+            pnl += _leg_pnl_inr(L["symbol"], L["sign"], L["lots"], prev[k], c, cfg)
+            prev[k] = c
+        held += 1
+        z    = z_by_date.get(t, np.nan)
+        left = min(sessions_to_expiry(sess, t, L["expiry"]) for L in legs)
+
+        reason = None
+        if np.isfinite(z) and abs(z) <= p.exit_z:
+            reason = "reverted"
+        elif np.isfinite(z) and abs(z) >= p.stop_z:
+            reason = "stop"
+        elif held >= p.holding_horizon_sessions:
+            reason = "horizon"
+        elif left <= lc.delivery_cutoff_sessions:
+            reason = "delivery_cutoff"
+        elif k_i + 1 >= len(sess):
+            reason = "end_of_data"
+
+        if reason is None:
+            daily.append((t, pnl))
+            k_i += 1
+            continue
+
+        # Exit fills
+        t_out = sess[k_i + 1] if k_i + 1 < len(sess) else t
+        ok    = (k_i + 1 < len(sess) and
+                 all(t_out in book(L).index and book(L).loc[t_out, "volume"] > 0
+                     for L in legs if book(L) is not None))
+        exit_px = {}
+        for k, L in enumerate(legs):
+            side   = "sell" if L["sign"] > 0 else "buy"
+            d      = book(L)
+            base   = d.loc[t_out, "open"] if ok and d is not None and t_out in d.index else prev[k]
+            exit_px[k] = _fill_price(base, side, L["symbol"], cfg, stress * (1 if ok else 3))
+            pnl += _leg_pnl_inr(L["symbol"], L["sign"], L["lots"], prev[k], exit_px[k], cfg)
+        cost += sum(
+            _trade_cost_inr(L["symbol"], "sell" if L["sign"] > 0 else "buy", exit_px[k], L["lots"], cfg)
+            for k, L in enumerate(legs)
+        )
+        t_end = t_out if ok else t
+        daily.append((t_end, pnl))
+        gross = float(sum(p_ for _, p_ in daily))
+        return dict(
+            signal_date=pd.Timestamp(signal_date), entry_date=t_in, exit_date=t_end,
+            reason=reason, hold_sessions=held, gross_inr=gross, cost_inr=float(cost),
+            net_inr=gross - float(cost), daily=daily,
+            exposure_g=_fine_gram_exposure(legs, cfg),
+        )
 
 
-def _get_vol_g(panel: pd.DataFrame, date_val: object, symbol: str, expiry: object | None) -> float:
-    if expiry is not None:
-        row = panel[(panel["date"] == date_val) & (panel["symbol"] == symbol) & (panel["expiry"] == expiry)]
-    else:
-        cands = panel[(panel["date"] == date_val) & (panel["symbol"] == symbol)]
-        if "dte" in cands.columns:
-            cands = cands[cands["dte"] > 0].sort_values("dte")
-        row = cands
-    if row.empty:
-        return 0.0
-    return float(row["vol_g"].iloc[0])
-
-
-def _split_sessions(sessions: list, cfg: Config) -> tuple[list, list, list]:
-    """Split session list into develop, validate, locked windows."""
-    n = len(sessions)
-    n_dev = int(n * cfg.backtest.split.develop)
-    n_val = int(n * cfg.backtest.split.validate_)
-    develop = sessions[:n_dev]
-    validate = sessions[n_dev: n_dev + n_val]
-    locked = sessions[n_dev + n_val:]
-    return develop, validate, locked
-
+# ------------------------------------------------------------------ run_backtest
 
 def run_backtest(
-    panel: pd.DataFrame,
-    signals: list[SignalRecord],
+    g: pd.DataFrame,
+    px: dict,
+    pn: pd.DataFrame,
     cfg: Config,
-    window: str = "develop",  # "develop" | "validate" | "locked"
+    start,
+    stress: float = 1.0,
+) -> pd.DataFrame:
+    """Chronological backtest: one open trade per series, at most max_open at once.
+
+    Reference: edge_ai_pipeline.py::run_backtest adapted to Config.
+    """
+    sessions = np.sort(pn["date"].unique())
+    z_series = {
+        sid: d.set_index("date")["z"]
+        for sid, d in g.groupby("series_id")
+    }
+    trades, open_until = [], {}
+    for row in g[(g["alert"]) & (g["date"] > start)].itertuples(index=False):
+        open_now = sum(1 for e in open_until.values() if e >= row.date)
+        if (open_until.get(row.series_id, pd.Timestamp.min) >= row.date
+                or open_now >= cfg.backtest.max_open):
+            continue
+        legs = legs_for(row._asdict(), cfg.backtest.basket_g, cfg)
+        t = simulate_trade(px, legs, row.date, z_series[row.series_id], sessions, cfg, stress)
+        if t is None:
+            continue
+        t.update(
+            series_id=row.series_id, pair=row.pair, legs=legs,
+            z_entry=row.z, gap_entry=row.gap_bps,
+        )
+        trades.append(t)
+        open_until[row.series_id] = t["exit_date"]
+    return pd.DataFrame(trades)
+
+
+# ------------------------------------------------------------------ locked-window guard
+
+def split_sessions(sessions, cfg: Config):
+    """Return (develop_end, validate_end) timestamps."""
+    n         = len(sessions)
+    n_dev     = int(n * cfg.backtest.split.develop)
+    n_val     = int(n * cfg.backtest.split.validate_)
+    dev_end   = pd.Timestamp(sessions[n_dev - 1])
+    val_end   = pd.Timestamp(sessions[n_dev + n_val - 1])
+    return dev_end, val_end
+
+
+def run_window(
+    g: pd.DataFrame,
+    px: dict,
+    pn: pd.DataFrame,
+    cfg: Config,
+    window: str = "develop",
     locked_lock_path: str = "runs/locked.lock",
     force: bool = False,
-) -> tuple[list[TradeRecord], pd.DataFrame]:
-    """Run the chronological backtest engine.
+    stress: float = 1.0,
+) -> pd.DataFrame:
+    """Run backtest for a named window (develop | validate | locked).
 
-    Returns (trade_records, equity_df).
-    equity_df has columns: date, portfolio_value, daily_pnl.
+    Locked window guard: refuses a second run unless force=True.
     """
     import pathlib
+    sessions  = np.sort(pn["date"].unique())
+    dev_end, val_end = split_sessions(sessions, cfg)
 
-    sessions = sorted(panel["date"].unique())
-    develop_s, validate_s, locked_s = _split_sessions(sessions, cfg)
-    window_map = {"develop": develop_s, "validate": validate_s, "locked": locked_s}
-    active_sessions = window_map[window]
-
-    # Locked window guard
-    if window == "locked":
+    if window == "develop":
+        start = pd.Timestamp(sessions[0]) - pd.Timedelta(days=1)
+        end   = dev_end
+    elif window == "validate":
+        start = dev_end
+        end   = val_end
+    elif window == "locked":
         lock_path = pathlib.Path(locked_lock_path)
         if lock_path.exists() and not force:
             raise RuntimeError(
                 "Locked window has already been run. "
-                "Pass force=True or --force to override."
+                "Delete runs/locked.lock or pass --force to override."
             )
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path.write_text("locked")
+        start = val_end
+        end   = pd.Timestamp(sessions[-1])
+    else:
+        raise ValueError(f"Unknown window: {window!r}")
 
-    signal_map: dict[object, list[SignalRecord]] = {}
-    for sig in signals:
-        if sig.alert:
-            signal_map.setdefault(sig.date, []).append(sig)
-
-    open_positions: list[Position] = []
-    pending_entries: list[tuple[Position, object]] = []  # (position, fill_date)
-    pending_exits: list[tuple[Position, object, str]] = []  # (position, fill_date, reason)
-    trades: list[TradeRecord] = []
-    equity_rows: list[dict] = []
-    portfolio_value = 0.0
-
-    for t_idx, t in enumerate(active_sessions):
-        # Fill pending entries (decided at t-1, fill at t)
-        new_entries: list[Position] = []
-        for pos, fill_date in list(pending_entries):
-            if fill_date != t:
-                continue
-            pending_entries.remove((pos, fill_date))
-            # Check liquidity / participation at t
-            px_a = _get_px(panel, t, pos.fam_a, None)
-            px_b = _get_px(panel, t, pos.fam_b, pos.expiry_b)
-            if px_a is None or px_b is None:
-                continue  # can't fill
-
-            # Participation cap
-            vol_g_a = _get_vol_g(panel, t, pos.fam_a, None)
-            max_g = vol_g_a * cfg.liquidity.max_participation
-            cfg_contract = cfg.contracts[pos.fam_a]
-            max_lots = int(max_g / cfg_contract.lot_g) if cfg_contract.lot_g > 0 else pos.lots_a
-            if max_lots == 0:
-                continue
-
-            actual_lots_a = min(pos.lots_a, max_lots)
-            pos.lots_a = actual_lots_a
-
-            cost_a = cost_per_leg(px_a, pos.lots_a, pos.fam_a, "buy", cfg)
-            cost_b = cost_per_leg(px_b, pos.lots_b, pos.fam_b, "sell", cfg)
-            pos.entry_px_a = px_a
-            pos.entry_px_b = px_b
-            pos.entry_cost_inr = cost_a["total_inr"] + cost_b["total_inr"]
-            pos.fill_date = t
-            new_entries.append(pos)
-
-        open_positions.extend(new_entries)
-
-        # Fill pending exits
-        for pos, fill_date, reason in list(pending_exits):
-            if fill_date != t:
-                continue
-            pending_exits.remove((pos, fill_date, reason))
-            if pos not in open_positions:
-                continue
-            px_a = _get_px(panel, t, pos.fam_a, None)
-            px_b = _get_px(panel, t, pos.fam_b, pos.expiry_b)
-            if px_a is None or px_b is None:
-                continue
-
-            # P&L on actual held contracts
-            cost_a_exit = cost_per_leg(px_a, pos.lots_a, pos.fam_a, "sell", cfg)
-            cost_b_exit = cost_per_leg(px_b, pos.lots_b, pos.fam_b, "buy", cfg)
-            exit_cost = cost_a_exit["total_inr"] + cost_b_exit["total_inr"]
-
-            cfg_a = cfg.contracts[pos.fam_a]
-            cfg_b = cfg.contracts[pos.fam_b]
-            gross_pnl = (
-                (px_a - pos.entry_px_a) * pos.lots_a * cfg_a.lot_g / cfg_a.quote_g
-                - (px_b - pos.entry_px_b) * pos.lots_b * cfg_b.lot_g / cfg_b.quote_g
-            )
-            net_pnl = gross_pnl - pos.entry_cost_inr - exit_cost
-            portfolio_value += net_pnl
-
-            is_synthetic = bool(panel[panel["date"] == t]["synthetic"].any()) if "synthetic" in panel.columns else False
-
-            trades.append(TradeRecord(
-                trade_id=pos.trade_id,
-                entry_date=pos.entry_date,
-                exit_date=t,
-                fam_a=pos.fam_a,
-                fam_b=pos.fam_b,
-                expiry_b=pos.expiry_b,
-                lots_a=pos.lots_a,
-                lots_b=pos.lots_b,
-                entry_px_a=pos.entry_px_a,
-                entry_px_b=pos.entry_px_b,
-                exit_px_a=px_a,
-                exit_px_b=px_b,
-                entry_cost_inr=pos.entry_cost_inr,
-                exit_cost_inr=exit_cost,
-                gross_pnl_inr=gross_pnl,
-                net_pnl_inr=net_pnl,
-                exit_reason=reason,
-                synthetic=is_synthetic,
-            ))
-            open_positions.remove(pos)
-
-        # Decide exits for open positions (signal-based and horizon)
-        for pos in list(open_positions):
-            sessions_held = active_sessions.index(t) - active_sessions.index(pos.fill_date) if pos.fill_date in active_sessions else 0
-            exit_reason = None
-            if sessions_held >= cfg.signals.holding_horizon_sessions:
-                exit_reason = "horizon"
-            # stop_z: check current gap z
-            # (simplified: use gap from today's signal if available)
-            if exit_reason is None:
-                today_sigs = signal_map.get(t, [])
-                for sig in today_sigs:
-                    if sig.fam_a == pos.fam_a and sig.fam_b == pos.fam_b and sig.expiry_b == pos.expiry_b:
-                        if not np.isnan(sig.z) and abs(sig.z) >= cfg.signals.stop_z:
-                            exit_reason = "stop_z"
-                        break
-            if exit_reason:
-                next_t_idx = t_idx + 1
-                if next_t_idx < len(active_sessions):
-                    fill_t = active_sessions[next_t_idx]
-                    pending_exits.append((pos, fill_t, exit_reason))
-
-        # Decide entries from today's alerts (fill on t+1)
-        if t_idx + 1 < len(active_sessions):
-            next_t = active_sessions[t_idx + 1]
-            for sig in signal_map.get(t, []):
-                alloc_a = gram_basket(cfg.backtest.basket_g, sig.fam_a, cfg)
-                alloc_b = gram_basket(cfg.backtest.basket_g, sig.fam_b, cfg)
-                pos = Position(
-                    trade_id=str(uuid.uuid4())[:8],
-                    fam_a=sig.fam_a,
-                    fam_b=sig.fam_b,
-                    expiry_b=sig.expiry_b,
-                    lots_a=alloc_a.lots,
-                    lots_b=alloc_b.lots,
-                    entry_date=t,
-                    fill_date=next_t,
-                    entry_px_a=0.0,
-                    entry_px_b=0.0,
-                    entry_cost_inr=0.0,
-                    entry_signal=sig,
-                )
-                pending_entries.append((pos, next_t))
-
-        equity_rows.append({"date": t, "portfolio_value": portfolio_value, "daily_pnl": 0.0})
-
-    equity_df = pd.DataFrame(equity_rows)
-    if not equity_df.empty:
-        equity_df["daily_pnl"] = equity_df["portfolio_value"].diff().fillna(0.0)
-
-    return trades, equity_df
+    g_win = g[(g["date"] > start) & (g["date"] <= end)].copy()
+    return run_backtest(g_win, px, pn, cfg, start, stress)

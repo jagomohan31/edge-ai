@@ -67,21 +67,28 @@ def compute_gold_factor(curves_df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     horizon = cfg.curve.gold_factor_horizon_days
     max_extrap = cfg.curve.max_extrapolation_days
 
-    from edge_ai.normalize import ln_price_at
-
     records: list[dict] = []
     families = cfg.data.symbols
 
     for date_val, grp in curves_df.groupby("date"):
-        # Try GOLDM first, then any family with >= 2 traded points
         G_val = float("nan")
         for fam in families:
-            fam_df = grp[(grp["family"] == fam) & (grp["traded"])][["dte", "ln_px_fine"]].dropna()
-            if len(fam_df) >= 2:
-                ln_g = ln_price_at(fam_df, float(horizon), max_extrap)
-                if ln_g is not None:
-                    G_val = float(np.exp(ln_g))
-                    break
+            fam_df = grp[(grp["family"] == fam) & grp["traded"]].dropna(subset=["ln_px_fine"])
+            if len(fam_df) < 2:
+                continue
+            sdf = fam_df.sort_values("dte")
+            x = sdf["dte"].to_numpy(float)
+            y = sdf["ln_px_fine"].to_numpy(float)
+            h = float(horizon)
+            if x[0] <= h <= x[-1]:
+                ln_g = float(np.interp(h, x, y))
+            else:
+                k, j = (0, 1) if h < x[0] else (-1, -2)
+                if abs(h - x[k]) > max_extrap:
+                    continue
+                ln_g = float(y[k] + (y[k]-y[j])/(x[k]-x[j]) * (h - x[k]))
+            G_val = float(np.exp(ln_g))
+            break
         records.append({"date": date_val, "G": G_val})
 
     factor_df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)

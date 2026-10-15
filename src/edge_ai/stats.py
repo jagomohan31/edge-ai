@@ -1,75 +1,118 @@
-"""stats.py: bootstrap CI, placebo, sub-period, slippage stress (Req 6.7)."""
+"""stats.py: bootstrap CI, placebo, sub-period, slippage stress (Req 6.7).
+
+Reference: edge_ai_ref.py::bootstrap_ci, edge_ai_pipeline.py::placebo_means.
+bootstrap_ci resamples trades (not days), seeded.
+placebo_means runs actual simulated trades with random entries.
+"""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from edge_ai.backtest import TradeRecord
 from edge_ai.config import Config
 
 
-def bootstrap_mean_pnl(trades: list[TradeRecord], cfg: Config) -> dict:
-    """Bootstrap confidence interval for mean net P&L per trade."""
-    rng = np.random.default_rng(cfg.stats.seed)
-    if not trades:
-        return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
-    pnls = np.array([t.net_pnl_inr for t in trades])
-    n = len(pnls)
-    samples = rng.choice(pnls, size=(cfg.stats.bootstrap_resamples, n), replace=True)
-    means = samples.mean(axis=1)
-    ci_low = float(np.percentile(means, 2.5))
-    ci_high = float(np.percentile(means, 97.5))
-    return {"mean": float(pnls.mean()), "ci_low": ci_low, "ci_high": ci_high, "n_trades": n}
+def bootstrap_ci(
+    x,
+    n: int = 10000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
+    """CI of the mean net P&L per trade, resampling trades.  Seeded.
+
+    Reference: edge_ai_ref.py::bootstrap_ci (exact copy).
+    """
+    x = np.asarray(x, float)
+    rng = np.random.default_rng(seed)
+    means = x[rng.integers(0, len(x), (n, len(x)))].mean(axis=1)
+    lo = float(np.percentile(means, 100 * alpha / 2))
+    hi = float(np.percentile(means, 100 * (1 - alpha / 2)))
+    return lo, hi
 
 
-def placebo_test(trades: list[TradeRecord], equity_df: pd.DataFrame, cfg: Config) -> dict:
-    """Placebo test: random entry dates, same holding-time distribution."""
-    rng = np.random.default_rng(cfg.stats.seed + 1)
-    if not trades or equity_df.empty:
-        return {"p_value": float("nan"), "placebo_mean": float("nan")}
-    all_dates = equity_df["date"].values
-    actual_mean = float(np.mean([t.net_pnl_inr for t in trades]))
-
-    daily_pnl = equity_df["daily_pnl"].values
-    placebo_means = []
-    for _ in range(cfg.stats.placebo_draws):
-        indices = rng.integers(0, len(all_dates), size=len(trades))
-        draws = daily_pnl[indices] if len(daily_pnl) > 0 else np.zeros(len(trades))
-        placebo_means.append(float(np.mean(draws)))
-
-    placebo_means_arr = np.array(placebo_means)
-    p_value = float((placebo_means_arr >= actual_mean).mean())
-    return {
-        "actual_mean": actual_mean,
-        "placebo_mean": float(placebo_means_arr.mean()),
-        "p_value": p_value,
-    }
+def bootstrap_mean_pnl(trades: pd.DataFrame, cfg: Config) -> dict:
+    """Convenience wrapper: bootstrap CI on net_inr column of trades DataFrame."""
+    if trades is None or trades.empty:
+        return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"), "n_trades": 0}
+    x   = trades["net_inr"].to_numpy(float)
+    lo, hi = bootstrap_ci(x, n=cfg.stats.bootstrap_resamples, seed=cfg.stats.seed)
+    return {"mean": float(x.mean()), "ci_low": lo, "ci_high": hi, "n_trades": len(x)}
 
 
-def sub_period_results(trades: list[TradeRecord], equity_df: pd.DataFrame) -> pd.DataFrame:
-    """Sub-period results by quarter."""
-    if not trades:
+def placebo_means(
+    g: pd.DataFrame,
+    px: dict,
+    pn: pd.DataFrame,
+    cfg: Config,
+    start,
+    n_trades: int,
+    holds: np.ndarray,
+    draws: int = 200,
+    seed: int = 42,
+) -> np.ndarray:
+    """Mean net P&L of random entries (same gates except z/net edge, same hold distribution).
+
+    Reference: edge_ai_pipeline.py::placebo_means adapted to Config.
+    """
+    from edge_ai.backtest import legs_for, simulate_trade
+
+    sessions = np.sort(pn["date"].unique())
+    pool = g[
+        (g["date"] > start) & g["liq_ok"]
+        & (g["sessions_to_expiry"] > cfg.lifecycle.delivery_cutoff_sessions + 1)
+        & g["baseline"].notna()
+    ]
+    rng      = np.random.default_rng(seed)
+    z_series = {sid: d.set_index("date")["z"] for sid, d in g.groupby("series_id")}
+    # never-revert config: exits only on horizon
+    import copy
+    cfg_ph = copy.deepcopy(cfg)
+    cfg_ph.signals.exit_z  = -1.0
+    cfg_ph.signals.stop_z  = 1e9
+
+    out = []
+    for _ in range(draws):
+        pick = pool.iloc[rng.choice(len(pool), size=min(n_trades * 3, len(pool)), replace=False)]
+        nets = []
+        for row in pick.itertuples(index=False):
+            h   = int(rng.choice(holds))
+            cfg_h = copy.deepcopy(cfg_ph)
+            cfg_h.signals.holding_horizon_sessions = h
+            rd  = row._asdict()
+            rd["dev"] = rd["dev"] if rng.random() < 0.5 else -rd["dev"]
+            t = simulate_trade(
+                px, legs_for(rd, cfg.backtest.basket_g, cfg),
+                rd["date"], z_series[rd["series_id"]], sessions, cfg_h
+            )
+            if t is not None:
+                nets.append(t["net_inr"])
+            if len(nets) >= n_trades:
+                break
+        if nets:
+            out.append(float(np.mean(nets)))
+    return np.array(out)
+
+
+def sub_period_results(trades: pd.DataFrame) -> pd.DataFrame:
+    """Sub-period (quarterly) breakdown of net P&L."""
+    if trades is None or trades.empty:
         return pd.DataFrame()
-    df = pd.DataFrame([
-        {
-            "date": t.exit_date,
-            "net_pnl": t.net_pnl_inr,
-        }
-        for t in trades
-    ])
-    df["date"] = pd.to_datetime(df["date"])
-    df["quarter"] = df["date"].dt.to_period("Q")
-    return df.groupby("quarter")["net_pnl"].agg(["sum", "mean", "count"]).reset_index()
+    df = trades[["exit_date", "net_inr"]].copy()
+    df["exit_date"] = pd.to_datetime(df["exit_date"])
+    df["quarter"]   = df["exit_date"].dt.to_period("Q")
+    return df.groupby("quarter")["net_inr"].agg(["sum", "mean", "count"]).reset_index()
 
 
-def slippage_stress(trades: list[TradeRecord], equity_df: pd.DataFrame, multipliers: list[int]) -> pd.DataFrame:
-    """Slippage stress: recompute net P&L at 1x, 2x, 3x slippage."""
+def slippage_stress(trades: pd.DataFrame, multipliers: list) -> pd.DataFrame:
+    """Net P&L sensitivity to slippage cost multiplier.
+
+    Approximate: re-scales the slippage portion of costs.
+    Cost breakdown is not stored per trade, so we scale total cost.
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame([{"slippage_multiplier": m, "net_pnl": 0.0} for m in multipliers])
     rows = []
-    for mult in multipliers:
-        # Approximate: slippage is embedded in costs; scale costs proportionally
-        stressed_pnl = sum(
-            t.gross_pnl_inr - (t.entry_cost_inr + t.exit_cost_inr) * mult
-            for t in trades
-        ) if trades else 0.0
-        rows.append({"slippage_multiplier": mult, "net_pnl": stressed_pnl})
+    for m in multipliers:
+        stressed = float((trades["gross_inr"] - trades["cost_inr"] * m).sum())
+        rows.append({"slippage_multiplier": m, "net_pnl": stressed})
     return pd.DataFrame(rows)

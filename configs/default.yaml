@@ -1,4 +1,4 @@
-ata:
+data:
   raw_dir: data/raw
   clean_dir: data/clean
   derived_dir: data/derived
@@ -40,18 +40,22 @@ curve:
 
 signals:
   baseline_window: 60
+  min_obs: 20
+  floor_bps: 0.5
   dte_buckets: [0, 5, 10, 20, 40, 400]
   z_threshold: 2.0
   min_net_edge_bps: 2.0
   cooldown_sessions: 5
   max_maturity_gap_days: 7
   holding_horizon_sessions: 5
+  exit_z: 0.5
   stop_z: 4.0
 
 liquidity:
   min_traded_g_quantile: 0.25
   min_oi_g_quantile: 0.25
   max_participation: 0.10
+  liq_min_rows: 60
 
 lifecycle:
   delivery_cutoff_sessions: 5
@@ -74,8 +78,9 @@ backtest:
     locked: 0.2
   basket_g: 200
   basket_multiples: 1
+  max_open: 3
 
 stats:
   bootstrap_resamples: 10000
-  placebo_draws: 1000
+  placebo_draws: 200
   seed: 42

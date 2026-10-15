@@ -197,3 +197,108 @@ def generate_and_save(
         group.drop(columns=["_date_mismatch", "_stale_injected"], errors="ignore").to_parquet(out, index=False)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Reference-compatible make_synthetic_panel (used by slow self-tests)
+# ---------------------------------------------------------------------------
+
+def _month_end(ts) -> pd.Timestamp:
+    """Last business day of the month containing ts."""
+    return pd.Timestamp(ts) + pd.offsets.BMonthEnd(0)
+
+
+def _fifth(y: int, m: int) -> pd.Timestamp:
+    """The 5th of month m/y, or the previous business day if it falls on a weekend."""
+    d = pd.Timestamp(y, m, 5)
+    return d if d.weekday() < 5 else d - pd.offsets.BDay(1)
+
+
+def make_synthetic_panel(
+    start: str = "2025-01-01",
+    end: str = "2026-09-30",
+    cfg: Config | None = None,
+    seed: int = 7,
+    mode: str = "noise_only",
+    carry: float = 0.07,
+) -> pd.DataFrame:
+    """Reference-compatible synthetic panel generator.
+
+    mode='noise_only'    : settlement noise that is NOT tradable at the next open.
+    mode='planted_edge'  : adds persistent AR(1) mispricing in the small contracts.
+
+    Returns a clean panel DataFrame with columns:
+    date, symbol, expiry, open, high, low, close, volume, oi, synthetic.
+    """
+    from edge_ai.config import load_config as _load
+    if cfg is None:
+        cfg = _load()
+
+    FAMS = ["GOLDM", "GOLDTEN", "GOLDGUINEA", "GOLDPETAL"]
+    rng = np.random.default_rng(seed)
+    sessions = pd.bdate_range(start, end)
+    n = len(sessions)
+
+    logS = np.log(8000.0) + np.cumsum(rng.normal(0.0004, 0.008, n))
+    S_close = np.exp(logS)
+    S_open  = np.exp(np.r_[logS[0], logS[:-1]] + 0.5 * np.diff(np.r_[logS[0], logS]))
+
+    months = pd.period_range(
+        pd.Timestamp(start) - pd.offsets.MonthBegin(2),
+        pd.Timestamp(end)   + pd.offsets.MonthBegin(5),
+        freq="M",
+    )
+    exp_map = {"GOLDM": [_fifth(p.year, p.month) for p in months]}
+    for f in FAMS[1:]:
+        exp_map[f] = [_month_end(p.start_time) for p in months]
+
+    delta: dict[str, np.ndarray] = {f: np.zeros(n) for f in FAMS}
+    if mode == "planted_edge":
+        for f, sig in (("GOLDTEN", 8.0), ("GOLDGUINEA", 10.0), ("GOLDPETAL", 12.0)):
+            x = 0.0
+            for i in range(n):
+                x = 0.8 * x + rng.normal(0, sig * np.sqrt(1 - 0.8 ** 2))
+                delta[f][i] = x * 1e-4
+
+    settle_sd = {"GOLDM": 0.3, "GOLDTEN": 1.5, "GOLDGUINEA": 2.0, "GOLDPETAL": 2.5}
+    open_sd   = {"GOLDM": 0.3, "GOLDTEN": 0.8, "GOLDGUINEA": 0.8, "GOLDPETAL": 0.8}
+    base_vol  = {"GOLDM": 14000, "GOLDTEN": 600, "GOLDGUINEA": 1200, "GOLDPETAL": 8000}
+
+    rows = []
+    for i, d in enumerate(sessions):
+        for f in FAMS:
+            live = sorted(e for e in exp_map[f] if 0 <= (e - d).days <= 100)
+            for r, e in enumerate(live):
+                dte        = (e - d).days
+                c          = cfg.contracts[f]
+                carry_f    = np.exp(carry * dte / 365)
+                cl_fine    = S_close[i] * carry_f * np.exp(
+                    delta[f][i] + rng.normal(0, settle_sd[f]) * 1e-4
+                )
+                prev_d     = 0.8 * delta[f][i - 1] if i > 0 else 0.0
+                op_fine    = S_open[i]  * carry_f * np.exp(
+                    prev_d + rng.normal(0, open_sd[f]) * 1e-4
+                )
+                # price = fine_price * fineness * quote_g, rounded to tick
+                def _q(fine_px: float, _c=c) -> float:
+                    return float(np.round(fine_px * _c.fineness * _c.quote_g))
+
+                close_p = _q(cl_fine)
+                open_p  = _q(op_fine)
+                vol = 0 if r >= 3 else int(
+                    base_vol[f] * 0.45 ** r
+                    * (0.4 + 1.2 * np.exp(-dte / 15))
+                    * rng.lognormal(0, 0.4)
+                )
+                high_p = max(open_p, close_p) + 1
+                low_p  = min(open_p, close_p) - 1
+                rows.append((d, f, e, open_p, high_p, low_p, close_p, vol, vol * 6))
+
+    df = pd.DataFrame(
+        rows,
+        columns=["date", "symbol", "expiry", "open", "high", "low", "close", "volume", "oi"],
+    )
+    df["date"]   = pd.to_datetime(df["date"])
+    df["expiry"] = pd.to_datetime(df["expiry"])
+    df["synthetic"] = True
+    return df

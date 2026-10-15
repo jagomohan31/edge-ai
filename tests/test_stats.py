@@ -1,50 +1,45 @@
-from datetime import date
-
+"""test_stats.py: stats module tests."""
+import numpy as np
 import pandas as pd
 
-from edge_ai.backtest import TradeRecord
 from edge_ai.config import load_config
-from edge_ai.stats import bootstrap_mean_pnl, slippage_stress, sub_period_results
+from edge_ai.stats import bootstrap_ci, bootstrap_mean_pnl, slippage_stress, sub_period_results
 
-_cfg = load_config()
+CFG = load_config()
 
+def _trades(nets):
+    rows = []
+    for i, net in enumerate(nets):
+        rows.append({
+            "net_inr": float(net), "gross_inr": float(net) + 200.0, "cost_inr": 200.0,
+            "exit_date": pd.Timestamp("2025-02-01") + pd.Timedelta(days=i * 5),
+            "hold_sessions": 3,
+        })
+    return pd.DataFrame(rows)
 
-def _make_trade(net_pnl: float) -> TradeRecord:
-    return TradeRecord(
-        trade_id="t1", entry_date=date(2025, 2, 1), exit_date=date(2025, 2, 6),
-        fam_a="GOLDM", fam_b="GOLDTEN", expiry_b=date(2025, 3, 27),
-        lots_a=2, lots_b=20,
-        entry_px_a=7000.0, entry_px_b=700.0,
-        exit_px_a=7010.0, exit_px_b=701.0,
-        entry_cost_inr=100.0, exit_cost_inr=100.0,
-        gross_pnl_inr=net_pnl + 200.0, net_pnl_inr=net_pnl,
-        exit_reason="horizon", synthetic=True,
-    )
+def test_bootstrap_ci_seeded():
+    x = np.random.default_rng(3).normal(5, 2, 200)
+    lo, hi = bootstrap_ci(x, n=2000, seed=7)
+    assert lo < x.mean() < hi
+    assert (lo, hi) == bootstrap_ci(x, n=2000, seed=7)
+    assert bootstrap_ci([4.0, 4.0, 4.0], n=100) == (4.0, 4.0)
 
+def test_bootstrap_mean_pnl_brackets_mean():
+    trades = _trades([100, 200, -50, 300, 150])
+    r = bootstrap_mean_pnl(trades, CFG)
+    assert r["ci_low"] <= r["mean"] <= r["ci_high"]
 
-def test_bootstrap_returns_ci():
-    trades = [_make_trade(float(v)) for v in [100, 200, -50, 300, 150]]
-    result = bootstrap_mean_pnl(trades, _cfg)
-    assert "mean" in result
-    assert result["ci_low"] <= result["mean"] <= result["ci_high"]
+def test_bootstrap_mean_pnl_empty():
+    r = bootstrap_mean_pnl(pd.DataFrame(), CFG)
+    assert r["n_trades"] == 0
 
-
-def test_bootstrap_empty():
-    result = bootstrap_mean_pnl([], _cfg)
-    assert result["mean"] != result["mean"]  # nan
-
-
-def test_slippage_stress_increases_with_multiplier():
-    trades = [_make_trade(500.0) for _ in range(5)]
-    equity = pd.DataFrame({"date": [], "portfolio_value": [], "daily_pnl": []})
-    df = slippage_stress(trades, equity, [1, 2, 3])
+def test_slippage_stress_increases():
+    trades = _trades([500.0] * 5)
+    df = slippage_stress(trades, [1, 2, 3])
     pnls = df["net_pnl"].values
     assert pnls[0] >= pnls[1] >= pnls[2]
 
-
-def test_sub_period_by_quarter():
-    trades = [_make_trade(100.0) for _ in range(4)]
-    equity = pd.DataFrame({"date": [], "portfolio_value": [], "daily_pnl": []})
-    df = sub_period_results(trades, equity)
-    assert "quarter" in df.columns
-    assert "sum" in df.columns
+def test_sub_period_has_quarter_column():
+    trades = _trades([100.0] * 4)
+    df = sub_period_results(trades)
+    assert "quarter" in df.columns and "sum" in df.columns

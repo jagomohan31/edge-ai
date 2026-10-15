@@ -1,87 +1,64 @@
+"""test_signals.py: signal DataFrame field tests."""
 import math
-from datetime import date
 
 import numpy as np
 import pandas as pd
 
-from edge_ai.clean import clean
 from edge_ai.config import load_config
-from edge_ai.normalize import compute_gaps
-from edge_ai.signals import _dte_bucket, _robust_z, compute_signals
-from edge_ai.synthetic import generate_bhavcopy
+from edge_ai.normalize import build_gaps, normalize_panel
+from edge_ai.signals import build_signals, find_alerts
+from edge_ai.synthetic import make_synthetic_panel
 
 
-def test_dte_bucket():
+def _pipeline(start="2025-01-02", end="2025-04-30", seed=1):
     cfg = load_config()
-    buckets = cfg.signals.dte_buckets
-    assert _dte_bucket(3, buckets) == 0   # [0, 5)
-    assert _dte_bucket(7, buckets) == 1   # [5, 10)
-    assert _dte_bucket(15, buckets) == 2  # [10, 20)
-
-
-def test_robust_z_basic():
-    history = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-    z, baseline, scale = _robust_z(2.5, history)
-    assert not math.isnan(z)
-    assert abs(baseline - 2.0) < 1e-6  # median of [0,1,2,3,4]
-    assert scale > 0
-
-
-def test_robust_z_empty_history():
-    z, baseline, scale = _robust_z(1.0, np.array([]))
-    assert math.isnan(z)
-
+    panel = make_synthetic_panel(start=start, end=end, cfg=cfg, mode="noise_only", seed=seed)
+    pn = normalize_panel(panel, cfg)
+    sessions = np.sort(pn["date"].unique())
+    dev_end = pd.Timestamp(sessions[int(0.6 * len(sessions)) - 1])
+    gaps = build_gaps(pn, cfg)
+    if gaps.empty:
+        return None, None, sessions
+    g = find_alerts(build_signals(gaps, pn, cfg, dev_end), cfg)
+    return g, pn, sessions
 
 def test_every_nonsignal_has_gate_reason():
-    # Every no-signal record must name the gate that blocked it.
-    cfg = load_config()
-    raw = generate_bhavcopy(date(2025, 1, 2), date(2025, 4, 30), cfg, inject_anomalies=False)
-    df, _ = clean(raw, cfg)
-    df["dte"] = (pd.to_datetime(df["expiry"]) - pd.to_datetime(df["date"])).dt.days
-    sessions = sorted(df["date"].unique())
-    df["session_idx"] = df["date"].map({d: i for i, d in enumerate(sessions)})
-    gaps = compute_gaps(df, cfg)
-    if gaps.empty:
+    g, pn, _ = _pipeline()
+    if g is None or g.empty:
         return
-    sigs = compute_signals(gaps, df, cfg)
-    for rec in sigs:
-        if not rec.alert:
-            assert rec.nearest_miss_gate != "", "No-signal record missing gate explanation"
+    blocked = g[~g["alert"]]
+    for _, row in blocked.iterrows():
+        assert row["blocked_by"] != "", "No-signal record missing gate explanation"
 
-
-def test_signal_record_fields():
-    cfg = load_config()
-    raw = generate_bhavcopy(date(2025, 1, 2), date(2025, 4, 30), cfg, inject_anomalies=False)
-    df, _ = clean(raw, cfg)
-    df["dte"] = (pd.to_datetime(df["expiry"]) - pd.to_datetime(df["date"])).dt.days
-    sessions = sorted(df["date"].unique())
-    df["session_idx"] = df["date"].map({d: i for i, d in enumerate(sessions)})
-    gaps = compute_gaps(df, cfg)
-    if gaps.empty:
+def test_required_columns_present():
+    g, _, _ = _pipeline()
+    if g is None or g.empty:
         return
-    sigs = compute_signals(gaps, df, cfg)
-    assert len(sigs) > 0
-    s = sigs[0]
-    assert hasattr(s, "date")
-    assert hasattr(s, "alert")
-    assert hasattr(s, "nearest_miss_gate")
+    for col in ("date","alert","blocked_by","z","baseline","scale","net_edge_bps","k"):
+        assert col in g.columns, f"missing column: {col}"
 
-
-def test_no_future_data_in_baseline():
-    # Baseline for session t must use only data strictly before t.
-    # Verify: records at the very first date have nan z (no prior history).
-    cfg = load_config()
-    raw = generate_bhavcopy(date(2025, 1, 2), date(2025, 1, 31), cfg, inject_anomalies=False)
-    df, _ = clean(raw, cfg)
-    df["dte"] = (pd.to_datetime(df["expiry"]) - pd.to_datetime(df["date"])).dt.days
-    sessions = sorted(df["date"].unique())
-    df["session_idx"] = df["date"].map({d: i for i, d in enumerate(sessions)})
-    gaps = compute_gaps(df, cfg)
-    if gaps.empty:
+def test_first_session_has_no_valid_baseline():
+    g, _, sessions = _pipeline(end="2025-01-31", seed=4)
+    if g is None or g.empty:
         return
-    sigs = compute_signals(gaps, df, cfg)
-    first_date = sessions[0]
-    first_day_sigs = [s for s in sigs if s.date == first_date]
-    # The very first session has no prior history -- z must be nan
-    for rec in first_day_sigs:
-        assert math.isnan(rec.z), f"Expected nan z on first session, got {rec.z}"
+    first = sessions[0]
+    for _, row in g[g["date"] == first].iterrows():
+        assert math.isnan(row["z"]) or math.isnan(row["baseline"]), (
+            "Expected nan baseline on first session, got z=" + str(row["z"]))
+
+def test_no_lookahead_in_baseline():
+    """Baselines at date t must use only data strictly before t."""
+    import numpy as np
+
+    from edge_ai.signals import walk_forward_baseline
+    rng = np.random.default_rng(9)
+    dates = pd.bdate_range("2025-01-01", periods=200)
+    rows = [(d, "A|0.0", rng.normal(0, 3)) for d in dates]
+    obs = pd.DataFrame(rows, columns=["date","key","gap_bps"])
+    a = walk_forward_baseline(obs, window=60, min_obs=20)
+    cut = obs["date"].unique()[150]
+    obs2 = obs.copy()
+    obs2.loc[obs2["date"] > cut, "gap_bps"] += 100.0
+    b = walk_forward_baseline(obs2, window=60, min_obs=20)
+    past = a["date"] <= cut
+    assert np.allclose(a.loc[past,"baseline"].to_numpy(), b.loc[past,"baseline"].to_numpy(), equal_nan=True)
