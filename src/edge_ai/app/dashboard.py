@@ -643,7 +643,7 @@ def _page_health() -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Edge AI  |  MCX Gold Analytics",
-        page_icon="🥇",
+        page_icon="EA",
         layout="wide",
         initial_sidebar_state="expanded",
     )
