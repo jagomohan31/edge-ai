@@ -8,11 +8,8 @@ build/
 .env
 *.env.*
 
-# Data files (large binary -- not in repo)
-*.parquet
+# Raw day-by-day fetch files (large, not needed on Cloud)
 data/raw/
-data/clean/
-data/derived/
 
 # Run artifacts
 runs/
@@ -27,6 +24,9 @@ runs/
 
 # Generated docs (rebuilt by CI)
 docs/REPORT.md
+
+# Large base64 helper
+src/edge_ai/app/assets/logo_b64.txt
 
 # OS
 .DS_Store
