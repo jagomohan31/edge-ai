@@ -4,7 +4,7 @@
 
 A data product that transforms MCX daily Bhavcopy into relative-value analytics for gold futures (GOLDM, GOLDTEN, GOLDGUINEA, GOLDPETAL). Walk-forward backtested, cost-adjusted, with no-lookahead guarantees.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://your-app.streamlit.app)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://edge-ai-nwttdutgdhlhfbkjdhelqq.streamlit.app)
 
 ---
 
