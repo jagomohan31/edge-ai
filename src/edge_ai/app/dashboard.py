@@ -104,7 +104,7 @@ def _page_parity() -> None:
     with col1:
         st.subheader("Latest gaps")
         st.dataframe(
-            latest[["fam_a", "fam_b", "dte_b", "gap_bps", "extrap_days", "liq_ok_a", "liq_ok_b", "stale"]],
+            latest[[col for col in ["fam_a", "fam_b", "dte_b", "gap_bps", "leg_gap_days", "extrap_days", "liq_ok_a", "liq_ok_b", "stale"] if col in latest.columns]],
             use_container_width=True,
         )
     with col2:
