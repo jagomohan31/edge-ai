@@ -240,3 +240,68 @@ def _append_trial(run_id: str, window: str, n_trades: int) -> None:
 
 if __name__ == "__main__":
     app()
+
+
+@app.command()
+def import_csv(
+    filepath: str = typer.Argument(..., help="Path to MCX BhavCopy CSV file"),
+    config: Path | None = typer.Option(None),  # noqa: B008
+) -> None:
+    """Import a downloaded MCX BhavCopy CSV/XLS into the raw data pipeline.
+
+    Download from https://www.mcxindia.com/market-data/bhavcopy
+    then run: edge-ai import-csv BhavCopyDateWise_14102026.csv
+    """
+    import pathlib as _pl
+    from datetime import datetime
+
+    import pandas as pd
+
+    src = _pl.Path(filepath)
+    if not src.exists():
+        typer.echo(f"File not found: {src}", err=True)
+        raise typer.Exit(1)
+
+    if src.suffix.lower() in (".xls", ".xlsx"):
+        df = pd.read_excel(src, header=0)
+    else:
+        df = pd.read_csv(src)
+
+    symbols = ["GOLDM", "GOLDTEN", "GOLDGUINEA", "GOLDPETAL"]
+    gold = df[
+        (df["Instrument Name"].str.strip() == "FUTCOM")
+        & (df["Symbol"].str.strip().isin(symbols))
+    ].copy()
+
+    if gold.empty:
+        typer.echo("No gold futures rows found.", err=True)
+        raise typer.Exit(1)
+
+    gold["Symbol"] = gold["Symbol"].str.strip()
+    gold["Expiry Date"] = gold["Expiry Date"].str.strip()
+
+    def _parse(s: str) -> str:
+        s = s.strip()
+        for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%m/%d/%Y")
+            except ValueError:
+                pass
+        raise ValueError(f"Cannot parse date: {s!r}")
+
+    gold["Date"] = gold["Date"].apply(_parse)
+    out = gold.rename(columns={
+        "Expiry Date": "ExpiryDate",
+        "Volume(Lots)": "Volume",
+        "Open Interest(Lots)": "OpenInterest",
+    })[["Date", "Symbol", "ExpiryDate", "Open", "High", "Low", "Close",
+        "Volume", "OpenInterest"]]
+
+    cfg = _load_cfg(config)
+    raw_dir = _pl.Path(cfg.data.raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_date = datetime.strptime(out["Date"].iloc[0], "%m/%d/%Y").strftime("%Y-%m-%d")
+    out_path = raw_dir / f"{raw_date}.parquet"
+    out.to_parquet(out_path, index=False)
+    typer.echo(f"Imported {len(out)} rows for {raw_date} -> {out_path}")
+    typer.echo("Now run: edge-ai build  then  edge-ai analyze  then  edge-ai signals")
